@@ -1,6 +1,7 @@
 // @ts-ignore
 import path from 'node:path'
-import {GenericContainer, PullPolicy, StartedTestContainer, Wait} from 'testcontainers'
+import {StartedTestContainer} from 'testcontainers'
+import {GATEWAY_IMAGE, startGateway} from './GatewayContainer'
 import {TestProject} from 'vitest/node.js'
 
 let container: StartedTestContainer
@@ -9,14 +10,9 @@ let container: StartedTestContainer
 export async function setup(project: TestProject) {
     // @ts-ignore
     if(import.meta.env.VITE_USE_GATEWAY_DOCKER === 'true') {
-        console.log('Starting Continuum Gateway')
+        console.log(`Starting Continuum Gateway ${GATEWAY_IMAGE}`)
 
-        container = await new GenericContainer((process.env.CONTINUUM_GATEWAY_IMAGE || 'mindsignited/continuum-gateway-server:3.1.0-SNAPSHOT'))
-            .withExposedPorts(58503)
-            .withEnvironment({SPRING_PROFILES_ACTIVE: "clienttest"})
-            .withPullPolicy(process.env.CONTINUUM_GATEWAY_IMAGE ? PullPolicy.defaultPolicy() : PullPolicy.alwaysPull())
-            .withWaitStrategy(Wait.forHttp('/', 58503))
-            .start()
+        container = await startGateway()
 
         // @ts-ignore
         project.provide('CONTINUUM_HOST', container.getHost())

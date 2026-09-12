@@ -1,15 +1,16 @@
 import {afterAll, beforeAll, describe, expect, it} from 'vitest'
 import {WebSocket} from 'ws'
 import {
-    AuthenticationError,
     ConnectedInfo,
     ConnectionInfo,
     ConnectionLostError,
+    ConnectionRefusedError,
     ContinuumError,
     ContinuumSingleton,
     IServiceProxy
 } from '../src'
-import {GenericContainer, StartedTestContainer, Wait} from 'testcontainers'
+import {StartedTestContainer} from 'testcontainers'
+import {GATEWAY_IMAGE, startGateway} from './GatewayContainer'
 import {logFailure, validateConnectedInfo} from './TestHelper'
 
 // This is required when running Continuum from node
@@ -24,22 +25,16 @@ Object.assign(global, { WebSocket})
  *
  *   1. a request in flight when the socket closes is failed then, with ConnectionLostError, rather
  *      than left waiting for a reply the lost server can no longer send
- *   2. when the reconnect is refused, the refusal is reported on fatalErrors as an AuthenticationError
- *      and the connection is already torn down - not left silently half alive
- *   3. the caller is free to connect again with credentials of its choosing, and it works
+ *   2. when the reconnect is refused, the refusal is reported on fatalErrors as a ConnectionRefusedError
+ *      carrying the server's message, and the connection is already down - not left silently half alive
+ *   3. the caller is free to connect again with credentials of its choosing, right there in the
+ *      fatalErrors handler, and it works
  *
  * Before this contract the refused reconnect deactivated the transport without running cleanup, so
  * pending requests waited forever, nothing was emitted, and the client was silently dead.
  *
- * Runs against a gateway built from continuum develop, which is what structures runs against. Build
- * it first from continuum-framework and give it the local tag:
- *   ./gradlew :continuum-gateway-server:bootBuildImage
- *   docker tag mindsignited/continuum-gateway-server:3.1.0-SNAPSHOT mindsignited/continuum-gateway-server:3.1.0-SNAPSHOT-local
+ * Runs against the gateway develop publishes; see GatewayContainer.ts to run it against a local build.
  */
-// The public snapshot continuum CI publishes on every push to develop. To test against a gateway built
-// locally instead, tag it and pass CONTINUUM_GATEWAY_IMAGE; a supplied image is never pulled, so a local
-// build is not replaced by whatever CI last published
-const GATEWAY_IMAGE = process.env.CONTINUUM_GATEWAY_IMAGE || 'mindsignited/continuum-gateway-server:3.1.0-SNAPSHOT'
 const HOST_PORT = 58598
 // The clienttest service as develop publishes it
 const TEST_SERVICE_CRI = 'org.kinotic.continuum.gatewayserver.clienttest.ITestService'
@@ -48,20 +43,10 @@ describe('Sticky Session Gateway Restart Tests', () => {
     let container: StartedTestContainer
     const connectionInfo: ConnectionInfo = new ConnectionInfo()
 
-    function startGateway(): Promise<StartedTestContainer> {
-        return new GenericContainer(GATEWAY_IMAGE)
-            .withExposedPorts({container: 58503, host: HOST_PORT})
-            .withEnvironment({SPRING_PROFILES_ACTIVE: "clienttest"})
-            .withWaitStrategy(Wait.forHttp('/', 58503))
-            // The image is amd64; under emulation on arm64 hosts it boots well past the 60s default
-            .withStartupTimeout(120000)
-            .withName('sticky-session-gateway-restart-test')
-            .start()
-    }
 
     beforeAll(async () => {
         console.log(`Starting Continuum Gateway ${GATEWAY_IMAGE} for sticky session gateway restart test`)
-        container = await startGateway()
+        container = await startGateway('sticky-session-gateway-restart-test', HOST_PORT)
         connectionInfo.host = container.getHost()
         connectionInfo.port = HOST_PORT
         // Bounded, as a client should be: enough to outlast a restart, not forever
@@ -88,8 +73,17 @@ describe('Sticky Session Gateway Restart Tests', () => {
         const service: IServiceProxy = continuum.serviceProxy(TEST_SERVICE_CRI)
         expect(await service.invoke('testMethodWithString', ['before'])).toBe('Hello before')
 
+        // The contract is that by the time fatalErrors emits the connection is already down, so the
+        // caller may connect again right there. The recovery is done inside the handler to pin exactly that.
         const fatal: ContinuumError[] = []
-        continuum.eventBus.fatalErrors.subscribe(e => fatal.push(e))
+        let activeWhenReported: boolean | null = null
+        const recovered = new Promise<ConnectedInfo>((resolve, reject) => {
+            continuum.eventBus.fatalErrors.subscribe(e => {
+                fatal.push(e)
+                activeWhenReported = continuum.eventBus.isConnectionActive()
+                continuum.connect(connectionInfo).then(resolve, reject)
+            })
+        })
 
         // Stage 1: hold a request open on the instance, then take the instance away underneath it
         let inFlightOutcome: 'resolved' | 'rejected' | null = null
@@ -115,21 +109,21 @@ describe('Sticky Session Gateway Restart Tests', () => {
         // presents it, is refused, and that must be reported with the connection already down.
         await sleep(10000)
         console.log('Starting a fresh gateway on the same address')
-        container = await startGateway()
+        container = await startGateway('sticky-session-gateway-restart-test', HOST_PORT)
 
-        await waitFor(() => fatal.length > 0, 1000 * 150)
-        expect(fatal.length, 'a refused reconnect must be reported on fatalErrors').toBeGreaterThan(0)
-        expect(fatal[0], 'the refusal is an authentication failure and should be typed as one')
-            .toBeInstanceOf(AuthenticationError)
-        // fatalErrors is emitted once the teardown has completed, so this should already hold; the
-        // short wait only guards the assertion against scheduling, not against the contract
-        await waitFor(() => !continuum.eventBus.isConnectionActive(), 10000)
-        expect(continuum.eventBus.isConnectionActive(),
-               'after a refused reconnect the connection must be torn down, not left silently dead').toBe(false)
+        // Stage 3: the caller decides how to recover - here, by connecting again with credentials from
+        // inside the fatalErrors handler, which only works if the connection was really down by then
+        const reconnectedInfo: ConnectedInfo = await logFailure(
+            Promise.race([recovered, sleep(1000 * 150).then(() => Promise.reject(new Error('fatalErrors never emitted')))]),
+            'Failed to connect again after the refusal')
 
-        // Stage 3: the caller decides how to recover - here, connect again with credentials
-        const reconnectedInfo: ConnectedInfo = await logFailure(continuum.connect(connectionInfo),
-                                                                'Failed to connect again after the refusal')
+        expect(fatal.length, 'a refused reconnect is reported on fatalErrors exactly once').toBe(1)
+        expect(fatal[0], 'the refusal is the server saying no, typed so a caller can tell it from anything else')
+            .toBeInstanceOf(ConnectionRefusedError)
+        expect(activeWhenReported,
+               'after a refused reconnect the connection must already be down when it is reported, not left silently half alive')
+            .toBe(false)
+
         validateConnectedInfo(reconnectedInfo)
         expect(reconnectedInfo.sessionId, 'a fresh connect yields a fresh session').not.toBe(originalSession)
         expect(await service.invoke('testMethodWithString', ['after'])).toBe('Hello after')

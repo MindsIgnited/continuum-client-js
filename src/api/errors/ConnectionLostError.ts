@@ -21,8 +21,9 @@ import {ContinuumError} from './ContinuumError'
  * Raised for a request that was in flight when the connection to the server was lost.
  *
  * The server that held the request can no longer deliver its reply, so the request is failed rather
- * than left waiting for a reply that will never arrive. Whether the connection is reconnecting or has
- * been given up on is not part of this error: it says only that this particular request is gone.
+ * than left waiting for a reply that will never arrive. It says only that this particular request is
+ * gone: whether the connection is reconnecting, was closed by the server, or was disconnected on
+ * purpose is not part of it, though the message says which.
  *
  * It is distinct from an application error returned by the server so that a caller can tell "the
  * server told me no" from "the server never got to answer", and retry the latter when the operation

@@ -97,8 +97,12 @@ export interface IEvent {
 export interface IEventBus {
 
     /**
-     * Any errors emitted by this observable will be fatal and the connection will be closed.
-     * You will need to resolve the problem and reconnect.
+     * Emits when the connection was closed by something other than {@link IEventBus#disconnect}, after a
+     * successful {@link IEventBus#connect}: the server refused a reconnect ({@link ConnectionRefusedError}),
+     * or {@link ConnectionInfo#maxConnectionAttempts} was reached. By then the connection is already down
+     * and every pending request has been failed; connect() again, with whatever credentials are right now,
+     * if the connection is wanted back. That may be done from inside the subscription.
+     * A refusal before connect() resolves rejects that promise instead of emitting here.
      */
     fatalErrors: Observable<ContinuumError>
 
@@ -157,7 +161,9 @@ export interface IEventBus {
      * Sends an {@link IEvent} expecting a response
      * All response correlation will be handled internally
      * @param event to send as the request
-     * @return a Promise that will resolve when the response is received
+     * @return a Promise that will resolve when the response is received, or reject with
+     *         {@link ConnectionLostError} if the connection closes first: no reply is coming for
+     *         this request, whether or not the connection recovers
      */
     request(event: IEvent): Promise<IEvent>
 
@@ -166,7 +172,10 @@ export interface IEventBus {
      * All response correlation will be handled internally
      * @param event to send as the request
      * @param sendControlEvents if true then control events will be sent to the server when changes to the returned to Observable are requested
-     * @return an {@link Observable<IEvent} that will provide the response stream
+     * @return an {@link Observable<IEvent} that will provide the response stream. It errors with
+     *         {@link ConnectionLostError} if the connection closes while it is open - including a socket
+     *         loss the connection then recovers from - since replies to it can no longer be delivered.
+     *         Subscribe again after reconnecting if the stream is still wanted.
      * NOTE: the naming here is similar to RSocket https://www.baeldung.com/rsocket#3-requeststream
      */
     requestStream(event: IEvent, sendControlEvents: boolean): Observable<IEvent>

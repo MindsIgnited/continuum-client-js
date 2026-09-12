@@ -1,7 +1,8 @@
 import {afterAll, beforeAll, describe, expect, it} from 'vitest'
 import {WebSocket} from 'ws'
 import {ConnectedInfo, ConnectionInfo, ContinuumSingleton} from '../src'
-import {GenericContainer, PullPolicy, StartedTestContainer, Wait} from 'testcontainers'
+import {StartedTestContainer} from 'testcontainers'
+import {startGateway} from './GatewayContainer'
 import { logFailure, validateConnectedInfo } from './TestHelper'
 import { TestService } from './ITestService'
 
@@ -16,13 +17,7 @@ describe('Disable Sticky Session Gateway Restart Reconnection Tests', () => {
         // Start the Continuum Gateway container
         console.log('Starting Continuum Gateway for sticky session gateway restart reconnection test')
 
-        container = await new GenericContainer((process.env.CONTINUUM_GATEWAY_IMAGE || 'mindsignited/continuum-gateway-server:3.1.0-SNAPSHOT'))
-            .withExposedPorts({container: 58503, host: 58599})
-            .withEnvironment({SPRING_PROFILES_ACTIVE: "clienttest"})
-            .withPullPolicy(process.env.CONTINUUM_GATEWAY_IMAGE ? PullPolicy.defaultPolicy() : PullPolicy.alwaysPull())
-            .withWaitStrategy(Wait.forHttp('/', 58503))
-            .withName('disable-sticky-session-reconnect-test')
-            .start()
+        container = await startGateway('disable-sticky-session-reconnect-test', 58599)
 
         // Create connection info with disableStickySession enabled
         connectionInfo.host = container.getHost()
@@ -59,13 +54,7 @@ describe('Disable Sticky Session Gateway Restart Reconnection Tests', () => {
         // Wait a moment for cleanup
         await new Promise(resolve => setTimeout(resolve, 10000))
         console.log('Starting Continuum Gateway again...')
-        container = await new GenericContainer((process.env.CONTINUUM_GATEWAY_IMAGE || 'mindsignited/continuum-gateway-server:3.1.0-SNAPSHOT'))
-            .withExposedPorts({container: 58503, host: 58599})
-            .withEnvironment({SPRING_PROFILES_ACTIVE: "clienttest"})
-            .withPullPolicy(process.env.CONTINUUM_GATEWAY_IMAGE ? PullPolicy.defaultPolicy() : PullPolicy.alwaysPull())
-            .withWaitStrategy(Wait.forHttp('/', 58503))
-            .withName('disable-sticky-session-reconnect-test')
-            .start()
+        container = await startGateway('disable-sticky-session-reconnect-test', 58599)
 
         // Update connection info with new port mapping
         console.log(`Continuum Gateway restarted`)

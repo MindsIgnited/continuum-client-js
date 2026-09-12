@@ -16,13 +16,12 @@
  */
 
 import {ConnectionInfo, ServerInfo} from '@/api/ConnectionInfo'
-import {AuthenticationError} from '@/api/errors/AuthenticationError'
 import {ConnectionLostError} from '@/api/errors/ConnectionLostError'
 import {ContinuumError} from '@/api/errors/ContinuumError'
 import {ConnectedInfo} from '@/api/security/ConnectedInfo'
 import {StompConnectionManager} from '@/core/api/StompConnectionManager'
 import {context, propagation} from '@opentelemetry/api';
-import {IFrame, IMessage} from '@stomp/rx-stomp'
+import {IMessage} from '@stomp/rx-stomp'
 import {ConnectableObservable, firstValueFrom, Observable, Subject, Subscription, throwError, Unsubscribable} from 'rxjs'
 import {filter, map, multicast} from 'rxjs/operators'
 import {Optional} from 'typescript-optional'
@@ -92,11 +91,12 @@ interface Carrier {
 export class EventBus implements IEventBus {
 
     /**
-     * Emits when the connection has been torn down by something other than a call to disconnect:
-     * the server refused a connect or a reconnect. By then the connection is already deactivated and
-     * every pending request has been failed; what remains is the caller's decision on whether and how
-     * to connect again. This is hot - it emits whether or not anyone is subscribed - so a subscription
-     * added after the fact will not replay a loss that has already happened.
+     * Emits when the connection was closed by something other than a call to disconnect(), after a
+     * successful connect(): the server refused a reconnect, or the bound on reconnection attempts was
+     * reached. By the time it emits the connection is already down and every pending request has been
+     * failed; what remains is the caller's decision on whether and how to connect again, which it may
+     * do from inside the subscription. A refusal before connect() resolves rejects that promise instead.
+     * This is hot: a subscription added after the fact does not see a loss that has already happened.
      */
     public readonly fatalErrors: Observable<ContinuumError>
     public serverInfo: ServerInfo | null = null
@@ -106,36 +106,29 @@ export class EventBus implements IEventBus {
     private requestRepliesSubject: Subject<IEvent> | null = null
     private requestRepliesSubscription: Subscription | null = null
     private fatalErrorSubject: Subject<ContinuumError> = new Subject<ContinuumError>()
+    /** True from connect() resolving until the connection closes: what decides whether a loss is reported here or by connect() */
+    private established: boolean = false
+    /** Why the connection closed, if it closed on its own, so a send() into the dead connection can say so */
+    private closeError: ContinuumError | null = null
 
     constructor() {
         this.fatalErrors = this.fatalErrorSubject.asObservable()
-        // The manager tears the connection down on a refused connect, and when the caller's bound on
-        // reconnect attempts is exhausted; this runs as part of both. The refusal is reported from the
-        // ERROR frame itself, so only the exhausted bound needs reporting here - once the initial connect
-        // has succeeded there is no promise left to reject, and without this it would end in silence.
-        this.stompConnectionManager.deactivationHandler = () => {
-            const manager = this.stompConnectionManager
-            const refusal = manager.lastRefusal
-            const attemptsExhausted = manager.maxConnectionAttemptsReached
-            // Only a loss after a working connection is reported here. A refused initial connect
-            // already reaches the caller as the rejected connect() promise, exactly as before.
-            const report = manager.initialConnectionSucceeded
-            this.cleanup()
-            if (!report) {
-                return
+        this.stompConnectionManager.events.subscribe(event => {
+            if (event.type === 'lost') {
+                // Reconnection, if any, carries on underneath; what was in flight is not coming back
+                this.failPendingRequests(new ConnectionLostError(
+                    'Connection to the server was lost while this request was in flight; it will not receive a reply'))
+            } else {
+                this.failPendingRequests(new ConnectionLostError(
+                    event.error ? `Connection closed: ${event.error.message}` : 'Connection disconnected'))
+                this.serverInfo = null
+                this.closeError = event.error ?? null
+                if (event.error && this.established) {
+                    this.fatalErrorSubject.next(event.error)
+                }
+                this.established = false
             }
-            if (refusal) {
-                this.fatalErrorSubject.next(EventBus.toFatalError(refusal))
-            } else if (attemptsExhausted) {
-                this.fatalErrorSubject.next(new ContinuumError(
-                    'Max connection attempts reached; the connection has been given up on'))
-            }
-        }
-        // The socket dropping fails what was in flight. Reconnection, if any, carries on underneath
-        this.stompConnectionManager.connectionLostHandler = () => {
-            this.failPendingRequests(new ConnectionLostError(
-                'Connection to the server was lost while this request was in flight; it will not receive a reply'))
-        }
+        })
     }
 
     public isConnectionActive(): boolean{
@@ -147,60 +140,55 @@ export class EventBus implements IEventBus {
     }
 
     public async connect(connectionInfo: ConnectionInfo): Promise<ConnectedInfo> {
-        if(!this.stompConnectionManager.active){
-
-            // reset state in case connection ended due to max connection attempts
-            this.cleanup()
-
-            const connectedInfo = await this.stompConnectionManager.activate(connectionInfo)
-            // manually copy so we don't store any sensitive info
-            this.serverInfo = new ServerInfo()
-            this.serverInfo.host = connectionInfo.host
-            this.serverInfo.port = connectionInfo.port
-            this.serverInfo.useSSL = connectionInfo.useSSL
-
-            // FIXME: a reply should not need a reply, therefore a replyCri probably should not be a EventConstants.SERVICE_DESTINATION_PREFIX
-            this.replyToCri = this.stompConnectionManager.replyToCri
-
-
-            return connectedInfo
-        }else{
-            throw new Error('Event Bus connection already active')
+        if (this.stompConnectionManager.active) {
+            throw new ContinuumError('Event Bus connection already active')
         }
+        this.closeError = null
+
+        const connectedInfo = await this.stompConnectionManager.activate(connectionInfo)
+        this.established = true
+        // manually copy so we don't store any sensitive info
+        this.serverInfo = new ServerInfo()
+        this.serverInfo.host = connectionInfo.host
+        this.serverInfo.port = connectionInfo.port
+        this.serverInfo.useSSL = connectionInfo.useSSL
+
+        // FIXME: a reply should not need a reply, therefore a replyCri probably should not be a EventConstants.SERVICE_DESTINATION_PREFIX
+        this.replyToCri = this.stompConnectionManager.replyToCri
+
+        return connectedInfo
     }
 
-    public async disconnect(force?: boolean): Promise<void> {
-        await this.stompConnectionManager.deactivate(force)
-
-        this.cleanup()
+    public disconnect(force?: boolean): Promise<void> {
+        // Everything else - failing what is pending, clearing serverInfo - happens on the closed event
+        return this.stompConnectionManager.deactivate(force)
     }
 
     public send(event: IEvent): void {
-        if(this.stompConnectionManager.rxStomp){
-            const headers: any = {}
-
-            for (const [key, value] of event.headers.entries()) {
-                headers[key] = value
-            }
-
-            const carrier: Carrier = {}
-            propagation.inject(context.active(), carrier)
-            if(carrier.traceparent){
-                headers[EventConstants.TRACEPARENT_HEADER] = carrier.traceparent
-            }
-            if(carrier.tracestate){
-                headers[EventConstants.TRACESTATE_HEADER] = carrier.tracestate
-            }
-
-            // send data over stomp
-            this.stompConnectionManager.rxStomp.publish({
-                                                            destination: event.cri,
-                                                            headers,
-                                                            binaryBody: event.data.orUndefined()
-                                                        })
-        }else{
+        if (!this.stompConnectionManager.active) {
             throw this.createSendUnavailableError()
         }
+        const headers: any = {}
+
+        for (const [key, value] of event.headers.entries()) {
+            headers[key] = value
+        }
+
+        const carrier: Carrier = {}
+        propagation.inject(context.active(), carrier)
+        if(carrier.traceparent){
+            headers[EventConstants.TRACEPARENT_HEADER] = carrier.traceparent
+        }
+        if(carrier.tracestate){
+            headers[EventConstants.TRACESTATE_HEADER] = carrier.tracestate
+        }
+
+        // send data over stomp
+        this.stompConnectionManager.publish({
+                                                destination: event.cri,
+                                                headers,
+                                                binaryBody: event.data.orUndefined()
+                                            })
     }
 
     public request(event: IEvent): Promise<IEvent> {
@@ -208,74 +196,77 @@ export class EventBus implements IEventBus {
     }
 
     public requestStream(event: IEvent, sendControlEvents: boolean = true): Observable<IEvent> {
-        if(this.stompConnectionManager?.rxStomp){
-            return new Observable<IEvent>((subscriber) => {
-
-                if (this.requestRepliesObservable == null) {
-                    this.requestRepliesSubject = new Subject<IEvent>()
-                    this.requestRepliesObservable = this._observe(this.replyToCri as string)
-                                                        .pipe(multicast(this.requestRepliesSubject)) as ConnectableObservable<IEvent>
-                    this.requestRepliesSubscription = this.requestRepliesObservable.connect()
-                }
-
-                let serverSignaledCompletion = false
-                const correlationId = uuidv4()
-                const defaultMessagesSubscription: Unsubscribable
-                          = this.requestRepliesObservable
-                                .pipe(filter((value: IEvent): boolean => {
-                                    return value.headers.get(EventConstants.CORRELATION_ID_HEADER) === correlationId
-                                })).subscribe({
-                                                  next(value: IEvent): void {
-
-                                                      if (value.hasHeader(EventConstants.CONTROL_HEADER)) {
-
-                                                          if (value.headers.get(EventConstants.CONTROL_HEADER) === 'complete') {
-                                                              serverSignaledCompletion = true
-                                                              subscriber.complete()
-                                                          } else {
-                                                              throw new Error('Control Header ' + value.headers.get(EventConstants.CONTROL_HEADER) + ' is not supported')
-                                                          }
-
-                                                      } else if (value.hasHeader(EventConstants.ERROR_HEADER)) {
-
-                                                          // TODO: add custom error type that contains error detail as well if provided by server, this would be the event body
-                                                          serverSignaledCompletion = true
-                                                          subscriber.error(new Error(value.getHeader(EventConstants.ERROR_HEADER)))
-
-                                                      } else {
-
-                                                          subscriber.next(value)
-
-                                                      }
-                                                  },
-                                                  error(err: any): void {
-                                                      subscriber.error(err)
-                                                  },
-                                                  complete(): void {
-                                                      subscriber.complete()
-                                                  }
-                                              })
-
-                subscriber.add(defaultMessagesSubscription)
-
-                event.setHeader(EventConstants.REPLY_TO_HEADER, this.replyToCri as string)
-                event.setHeader(EventConstants.CORRELATION_ID_HEADER, correlationId)
-
-                this.send(event)
-
-                return () => {
-                    if (sendControlEvents && !serverSignaledCompletion) {
-                        // create control event to cancel long-running request
-                        const controlEvent: Event = new Event(event.cri)
-                        controlEvent.setHeader(EventConstants.CONTROL_HEADER, EventConstants.CONTROL_VALUE_CANCEL)
-                        controlEvent.setHeader(EventConstants.CORRELATION_ID_HEADER, correlationId)
-                        this.send(controlEvent)
-                    }
-                }
-            })
-        }else{
+        if(!this.stompConnectionManager.active){
             return throwError(() => this.createSendUnavailableError())
         }
+        return new Observable<IEvent>((subscriber) => {
+
+            if (this.requestRepliesObservable == null) {
+                this.requestRepliesSubject = new Subject<IEvent>()
+                this.requestRepliesObservable = this._observe(this.replyToCri as string)
+                                                    .pipe(multicast(this.requestRepliesSubject)) as ConnectableObservable<IEvent>
+                this.requestRepliesSubscription = this.requestRepliesObservable.connect()
+            }
+
+            // Set once the request can no longer be cancelled: the server finished it, or the
+            // connection failed it. Either way there is no one to send a cancel to.
+            let finished = false
+            const correlationId = uuidv4()
+            const defaultMessagesSubscription: Unsubscribable
+                      = this.requestRepliesObservable
+                            .pipe(filter((value: IEvent): boolean => {
+                                return value.headers.get(EventConstants.CORRELATION_ID_HEADER) === correlationId
+                            })).subscribe({
+                                              next(value: IEvent): void {
+
+                                                  if (value.hasHeader(EventConstants.CONTROL_HEADER)) {
+
+                                                      if (value.headers.get(EventConstants.CONTROL_HEADER) === 'complete') {
+                                                          finished = true
+                                                          subscriber.complete()
+                                                      } else {
+                                                          throw new Error('Control Header ' + value.headers.get(EventConstants.CONTROL_HEADER) + ' is not supported')
+                                                      }
+
+                                                  } else if (value.hasHeader(EventConstants.ERROR_HEADER)) {
+
+                                                      // TODO: add custom error type that contains error detail as well if provided by server, this would be the event body
+                                                      finished = true
+                                                      subscriber.error(new Error(value.getHeader(EventConstants.ERROR_HEADER)))
+
+                                                  } else {
+
+                                                      subscriber.next(value)
+
+                                                  }
+                                              },
+                                              error(err: any): void {
+                                                  finished = true
+                                                  subscriber.error(err)
+                                              },
+                                              complete(): void {
+                                                  finished = true
+                                                  subscriber.complete()
+                                              }
+                                          })
+
+            subscriber.add(defaultMessagesSubscription)
+
+            event.setHeader(EventConstants.REPLY_TO_HEADER, this.replyToCri as string)
+            event.setHeader(EventConstants.CORRELATION_ID_HEADER, correlationId)
+
+            this.send(event)
+
+            return () => {
+                if (sendControlEvents && !finished && this.stompConnectionManager.active) {
+                    // create control event to cancel long-running request
+                    const controlEvent: Event = new Event(event.cri)
+                    controlEvent.setHeader(EventConstants.CONTROL_HEADER, EventConstants.CONTROL_VALUE_CANCEL)
+                    controlEvent.setHeader(EventConstants.CORRELATION_ID_HEADER, correlationId)
+                    this.send(controlEvent)
+                }
+            }
+        })
     }
 
     public listen(_serverInfo: ServerInfo): Promise<void> {
@@ -284,12 +275,6 @@ export class EventBus implements IEventBus {
 
     public observe(cri: string): Observable<IEvent> {
         return this._observe(cri)
-    }
-
-    private cleanup(): void{
-        this.failPendingRequests(new ConnectionLostError('Connection disconnected'))
-
-        this.serverInfo = null
     }
 
     /**
@@ -311,24 +296,14 @@ export class EventBus implements IEventBus {
         }
     }
 
-    private static toFatalError(frame: IFrame): ContinuumError {
-        const message: string = frame.headers['message'] ?? 'Connection refused by server'
-        // The gateway reports a refused credential or session as an authentication failure
-        if (/authenticat/i.test(message)) {
-            return new AuthenticationError(message)
-        }
-        return new ContinuumError(message)
-    }
-
     /**
-     * Creates the proper error to return if this.stompConnectionManager?.rxStomp is not available on a send request
+     * Creates the proper error to return when the connection is not active on a send request
      */
     private createSendUnavailableError(): Error {
-        let ret: string = 'You must call connect on the event bus before sending any request'
-        if(this.stompConnectionManager.maxConnectionAttemptsReached){
-            ret = 'Max connection attempts reached event bus is not available'
+        if (this.closeError) {
+            return new ContinuumError(`The event bus connection closed and must be connected again: ${this.closeError.message}`)
         }
-        return new Error(ret)
+        return new ContinuumError('You must call connect on the event bus before sending any request')
     }
 
     /**
@@ -338,29 +313,26 @@ export class EventBus implements IEventBus {
      * @return the cold {@link Observable<IEvent>} for the given destination
      */
     private _observe(cri: string): Observable<IEvent> {
-        if(this.stompConnectionManager?.rxStomp) {
-            return this.stompConnectionManager
-                       .rxStomp
-                       .watch(cri)
-                       .pipe(map<IMessage, IEvent>((message: IMessage): IEvent => {
-
-                           // We translate all IMessage objects to IEvent objects
-                           const headers: Map<string, string> = new Map<string, string>()
-                           let destination: string = ''
-                           for (const prop of Object.keys(message.headers)) {
-                               if (prop === 'destination') {
-                                   destination = message.headers[prop]
-                               }else{
-                                   headers.set(prop, message.headers[prop])
-                               }
-                           }
-
-                           return new Event(destination, headers, message.binaryBody)
-                       }))
-        }else{
+        if(!this.stompConnectionManager.active) {
             throw this.createSendUnavailableError()
         }
+        return this.stompConnectionManager
+                   .watch(cri)
+                   .pipe(map<IMessage, IEvent>((message: IMessage): IEvent => {
+
+                       // We translate all IMessage objects to IEvent objects
+                       const headers: Map<string, string> = new Map<string, string>()
+                       let destination: string = ''
+                       for (const prop of Object.keys(message.headers)) {
+                           if (prop === 'destination') {
+                               destination = message.headers[prop]
+                           }else{
+                               headers.set(prop, message.headers[prop])
+                           }
+                       }
+
+                       return new Event(destination, headers, message.binaryBody)
+                   }))
     }
 
 }
-

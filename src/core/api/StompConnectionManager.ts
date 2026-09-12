@@ -1,53 +1,71 @@
 import {ConnectionInfo} from '@/api/ConnectionInfo'
+import {ConnectionRefusedError} from '@/api/errors/ConnectionRefusedError'
+import {ContinuumError} from '@/api/errors/ContinuumError'
 import {ConnectedInfo} from '@/api/security/ConnectedInfo'
 import {EventConstants} from '@/core/api/IEventBus'
-import {IFrame, RxStomp, RxStompConfig, RxStompState, StompHeaders} from '@stomp/rx-stomp'
+import {IFrame, IMessage, IRxStompPublishParams, RxStomp, RxStompConfig, RxStompState, StompHeaders} from '@stomp/rx-stomp'
 import {ReconnectionTimeMode} from '@stomp/stompjs'
-import {Subscription} from 'rxjs'
+import {Observable, Subject} from 'rxjs'
 import {v4 as uuidv4} from 'uuid'
 import debug from 'debug'
 
 /**
+ * What the connection reports about itself, in the order it happens.
+ *
+ * `lost`: the socket of an established connection closed. Reconnection carries on underneath, but
+ * anything in flight on the old socket cannot complete and should be failed now.
+ *
+ * `closed`: the connection is down and will not reconnect. Emitted exactly once per activation, after
+ * the manager is already inactive, so a subscriber may call activate() again from inside the handler.
+ * `error` says why when it was not asked for: the server refused us with an ERROR frame, or the bound
+ * on reconnection attempts was reached. It is absent when deactivate() was called.
+ */
+export type ConnectionEvent =
+    | { type: 'lost' }
+    | { type: 'closed', error?: ContinuumError }
+
+/**
  * Creates a new RxStomp client and manages it
  * This is here to simplify the logic needed for connection management and the usage of the client.
+ *
+ * The manager is a small state machine: inactive -> active -> closing -> inactive. Everything else about
+ * the connection is reported through {@link events}; nothing here needs to be read back after the fact.
  */
 export class StompConnectionManager {
 
-    public lastWebsocketError: Event | null = null
-    /**
-     * This will return true if a {@link ConnectionInfo#maxConnectionAttempts} threshold was set and was reached
-     */
-    public maxConnectionAttemptsReached: boolean = false
-    public rxStomp: RxStomp | null = null
+    public readonly events: Observable<ConnectionEvent>
+    private readonly eventSubject = new Subject<ConnectionEvent>()
     private readonly INITIAL_RECONNECT_DELAY: number = 2000
     private readonly MAX_RECONNECT_DELAY: number = 120000 // 2 mins
     private readonly JITTER_MAX: number = 5000
-    private connectionAttempts: number = 0
-    private initialConnectionSuccessful: boolean = false
     private debugLogger = debug('continuum:stomp')
+
+    private state: 'inactive' | 'active' | 'closing' = 'inactive'
+    private rxStomp: RxStomp | null = null
+    /** The teardown in progress, so a deactivate() that overlaps another waits on it rather than repeating it */
+    private closing: Promise<void> | null = null
+    /** Rejects the activate() promise, until the first CONNECTED frame settles it */
+    private rejectActivation: ((error: ContinuumError) => void) | null = null
+
     private replyToId = uuidv4()
-    public _replyToCri =  EventConstants.SERVICE_DESTINATION_PREFIX + this.replyToId + ':' + uuidv4() + '@continuum.js.EventBus/replyHandler'
-    public deactivationHandler: (() => void) | null = null
-    /**
-     * Invoked each time an established connection's socket closes, before any reconnect attempt.
-     * Anything in flight on the old socket cannot complete, so this is where it is failed.
-     */
-    public connectionLostHandler: (() => void) | null = null
-    /**
-     * The ERROR frame that caused the most recent teardown, if that is why it happened. Set before
-     * deactivate() runs so the deactivation handler can report it once the connection is actually down.
-     */
-    public lastRefusal: IFrame | null = null
-    /** True once a CONNECTED frame has ever been received on this activation. */
-    public get initialConnectionSucceeded(): boolean {
-        return this.initialConnectionSuccessful
+    private _replyToCri = EventConstants.SERVICE_DESTINATION_PREFIX + this.replyToId + ':' + uuidv4() + '@continuum.js.EventBus/replyHandler'
+
+    // Per activation
+    /** The session the server gave us, when sticky sessions are on. The only thing a reconnect presents. */
+    private sessionId: string | null = null
+    private connectionAttempts: number = 0
+    private everConnected: boolean = false
+    private lastWebsocketError: Event | null = null
+
+    constructor() {
+        this.events = this.eventSubject.asObservable()
     }
 
     /**
      * @return true if this {@link StompConnectionManager} is actively trying to maintain a connection to the Stomp server, false if not.
      */
     public get active(): boolean {
-        return !!this.rxStomp;
+        return this.state === 'active'
     }
 
     public get replyToCri(): string {
@@ -58,219 +76,228 @@ export class StompConnectionManager {
      * return true if this {@link StompConnectionManager} is active and has a connection to the stomp server
      */
     public get connected(): boolean {
-        return this.rxStomp != null
-            && this.rxStomp.connected()
+        return this.active && this.rxStomp!.connected()
     }
 
+    /**
+     * Connects, and keeps reconnecting until {@link deactivate} is called, the server refuses a connect, or
+     * {@link ConnectionInfo#maxConnectionAttempts} is reached. The returned promise settles on the first
+     * CONNECTED frame; a refusal or exhausted bound before that rejects it, after that it is reported on
+     * {@link events} as a `closed` event carrying the error.
+     */
     public activate(connectionInfo: ConnectionInfo): Promise<ConnectedInfo> {
+        if (!connectionInfo) {
+            return Promise.reject(new ContinuumError('You must supply a valid connectionInfo object'))
+        }
+        if (!connectionInfo.host) {
+            return Promise.reject(new ContinuumError('No host provided'))
+        }
+        if (this.state === 'closing') {
+            return Promise.reject(new ContinuumError('Stomp connection is still closing'))
+        }
+        if (this.state === 'active') {
+            return Promise.reject(new ContinuumError('Stomp connection already active'))
+        }
+
+        this.state = 'active'
+        this.sessionId = null
+        this.connectionAttempts = 0
+        this.everConnected = false
+        this.lastWebsocketError = null
+
+        const url = 'ws' + (connectionInfo.useSSL ? 's' : '')
+            + '://' + connectionInfo.host
+            + (connectionInfo.port ? ':' + connectionInfo.port : '') + '/v1'
+
+        const rxStomp = new RxStomp()
+        this.rxStomp = rxStomp
+
         return new Promise((resolve, reject): void => {
-            // Validate state and short circuit
-            if(!connectionInfo){
-                reject('You must supply a valid connectionInfo object')
-                return
-            }
-
-            if (!(connectionInfo.host)) {
-                reject('No host provided')
-                return
-            }
-
-            if(this.rxStomp) {
-                reject('Stomp connection already active')
-                return
-            }
-
-            // we reset most state here so, it will persist on a connection failure
-            this.connectionAttempts = 0
-            this.initialConnectionSuccessful = false
-            this.lastWebsocketError = null
-            this.maxConnectionAttemptsReached = false
-            this.lastRefusal = null
-
-            const url = 'ws' + (connectionInfo.useSSL ? 's' : '')
-                + '://' + connectionInfo.host
-                + (connectionInfo.port ? ':' + connectionInfo.port : '') + '/v1'
-
-            this.rxStomp = new RxStomp()
-
-            // Work on a copy. The sticky session path below replaces the credentials in this map with the
-            // session id, and doing that to the caller's own object silently stripped its credentials -
-            // so after a refused reconnect the caller could not connect again with the same ConnectionInfo,
-            // which is precisely what it is expected to do.
-            let connectHeadersInternal: StompHeaders = (typeof connectionInfo.connectHeaders !== 'function' && connectionInfo.connectHeaders != null
-                ? {...connectionInfo.connectHeaders}
-                : {})
+            this.rejectActivation = reject
 
             const stompConfig: RxStompConfig = {
                 brokerURL: url,
-                connectHeaders: connectHeadersInternal,
                 heartbeatIncoming: 120000,
                 heartbeatOutgoing: 30000,
                 reconnectDelay: this.INITIAL_RECONNECT_DELAY,
                 beforeConnect: async (): Promise<void> => {
-
-                    if(typeof connectionInfo.connectHeaders === 'function'){
-                        const headers = await connectionInfo.connectHeaders()
-                        for(const key in headers) {
-                            connectHeadersInternal[key] = headers[key]
+                    // If max connections are set then make sure we have not exceeded that threshold
+                    if (connectionInfo.maxConnectionAttempts) {
+                        this.connectionAttempts++
+                        if (this.connectionAttempts > connectionInfo.maxConnectionAttempts) {
+                            const message = (this.lastWebsocketError as any)?.message ?? 'UNKNOWN'
+                            await this.close(new ContinuumError(`Max number of reconnection attempts reached. Last WS Error ${message}`))
+                            return
                         }
                     }
-
-                    if(connectionInfo.disableStickySession){
-                        connectHeadersInternal[EventConstants.DISABLE_STICKY_SESSION_HEADER] = 'true'
-                    }
-
-                    // use replyToId if provided in connectionInfo, otherwise set it
-                    if(connectHeadersInternal[EventConstants.REPLY_TO_ID_HEADER]){
-                        this.replyToId = connectHeadersInternal[EventConstants.REPLY_TO_ID_HEADER]
-                        this._replyToCri =  EventConstants.SERVICE_DESTINATION_PREFIX + this.replyToId + ':' + uuidv4() + '@continuum.js.EventBus/replyHandler'
-                    }else{
-                        connectHeadersInternal[EventConstants.REPLY_TO_ID_HEADER] = this.replyToId
-                    }
-
-                    // If max connections are set then make sure we have not exceeded that threshold
-                    if(connectionInfo?.maxConnectionAttempts){
-                        this.connectionAttempts++
-
-                       if(this.connectionAttempts > connectionInfo.maxConnectionAttempts){
-
-                           // Reached threshold give up
-                           this.maxConnectionAttemptsReached = true
-                           await this.deactivate()
-
-                           // If we have not made an initial connection, the promise is not yet resolved
-                           if(!this.initialConnectionSuccessful) {
-                               let message = (this.lastWebsocketError as any)?.message ? (this.lastWebsocketError as any)?.message : 'UNKNOWN'
-                               reject(`Max number of reconnection attempts reached. Last WS Error ${message}`)
-                           }
-                       }else{
-                           await this.connectionJitterDelay();
-                       }
-                   }else{
-                        await this.connectionJitterDelay();
-                   }
-               }
+                    await this.connectionJitterDelay()
+                    // Headers are built fresh for every attempt, so nothing is ever mutated: not the
+                    // caller's object, and not what an earlier attempt sent
+                    rxStomp.stompClient.connectHeaders = await this.connectHeadersForAttempt(connectionInfo)
+                }
             }
 
-            if(this.debugLogger.enabled){
+            if (this.debugLogger.enabled) {
                 stompConfig.debug = (msg: string): void => {
                     this.debugLogger(msg)
                 }
             }
 
-            //*** Begin Block that handles backoff ***
-            this.rxStomp.configure(stompConfig)
+            rxStomp.configure(stompConfig)
 
             // Set values that are only accessible from the stompClient
-            this.rxStomp.stompClient.maxReconnectDelay = this.MAX_RECONNECT_DELAY
-            this.rxStomp.stompClient.reconnectTimeMode = ReconnectionTimeMode.EXPONENTIAL
+            rxStomp.stompClient.maxReconnectDelay = this.MAX_RECONNECT_DELAY
+            rxStomp.stompClient.reconnectTimeMode = ReconnectionTimeMode.EXPONENTIAL
 
-            // Handles Websocket Errors
-            this.rxStomp.webSocketErrors$.subscribe(value => {
+            rxStomp.webSocketErrors$.subscribe((value: Event) => {
                 this.lastWebsocketError = value
             })
 
-            // Handles Successful Connections
-            const connectedSubscription: Subscription = this.rxStomp.connected$.subscribe(() =>{
-                connectedSubscription.unsubscribe()
-                // Successful Connection
-                if(!this.initialConnectionSuccessful){
-                    this.initialConnectionSuccessful = true
-                }
+            // A STOMP ERROR frame means the server is done with us: it refused the connect, refused a
+            // reconnect presenting a session it no longer has, or rejected something we sent. The library
+            // cannot recover on its own - it holds no credentials, only the session id - so it closes and
+            // leaves connecting again to the caller. The socket is discarded rather than closed politely;
+            // there is nothing left to say, and waiting on the server's close would only delay the report.
+            rxStomp.stompErrors$.subscribe((frame: IFrame) => {
+                this.close(new ConnectionRefusedError(frame), true)
+                    .catch(e => this.debugLogger(`Error closing after ERROR frame: ${e}`))
             })
 
-            // A STOMP ERROR frame means the server refused us - on the initial connect, or on a later
-            // reconnect presenting a session the server no longer has. Either way the library cannot
-            // recover on its own: it holds no credentials, only the session id that was just refused.
-            // So it tears down through deactivate(), which runs the deactivation handler so pending
-            // requests are failed and the fatal error is surfaced, and leaves reconnecting to the caller.
-            // Previously this called rxStomp.deactivate() directly, which skipped that handler and left
-            // the client silently dead with every in-flight request waiting forever.
-            const errorSubscription: Subscription = this.rxStomp.stompErrors$.subscribe((value: IFrame) => {
-                errorSubscription.unsubscribe()
-                const message = value.headers['message']
-                this.lastRefusal = value
-                void this.deactivate().finally(() => reject(message))
-            })
-
-            // Fail whatever was in flight the moment the socket closes. The reply address is per
-            // connection and the server that held the request may be gone, so those replies are not
-            // coming; a clean failure now beats a reply that sometimes sneaks through after reconnect.
+            // The socket of an established connection closing means whatever was in flight is gone.
+            // Only reported when the close was not ours: a deactivate() ends in a `closed` event instead.
             let wasOpen = false
-            this.rxStomp.connectionState$.subscribe((state: RxStompState) => {
+            rxStomp.connectionState$.subscribe((state: RxStompState) => {
                 if (state === RxStompState.OPEN) {
                     wasOpen = true
                 } else if (wasOpen && (state === RxStompState.CLOSING || state === RxStompState.CLOSED)) {
                     wasOpen = false
-                    this.connectionLostHandler?.()
+                    if (this.state === 'active') {
+                        this.eventSubject.next({type: 'lost'})
+                    }
                 }
             })
 
             // This is triggered when the server sends a CONNECTED frame.
-            const serverHeadersSubscription: Subscription = this.rxStomp.serverHeaders$.subscribe((value: StompHeaders) => {
-                let connectedInfoJson: string | undefined = value[EventConstants.CONNECTED_INFO_HEADER]
-                if (connectedInfoJson != null) {
+            rxStomp.serverHeaders$.subscribe((headers: StompHeaders) => {
+                const connectedInfoJson: string | undefined = headers[EventConstants.CONNECTED_INFO_HEADER]
+                if (connectedInfoJson == null) {
+                    this.close(new ContinuumError('Server did not return proper data for successful login'), true)
+                        .catch(e => this.debugLogger(`Error closing after bad CONNECTED frame: ${e}`))
+                    return
+                }
+                const connectedInfo: ConnectedInfo = JSON.parse(connectedInfoJson)
 
-                    const connectedInfo: ConnectedInfo = JSON.parse(connectedInfoJson)
-
-                    if(!connectionInfo.disableStickySession){
-
-                        serverHeadersSubscription.unsubscribe()
-
-                        if (connectedInfo.sessionId != null && connectedInfo.replyToId != null) {
-
-                            // Remove all information originally sent from the connect headers
-                            if (connectionInfo.connectHeaders != null) {
-                                for (let key in connectHeadersInternal) {
-                                    delete connectHeadersInternal[key]
-                                }
-                            }
-
-                            connectHeadersInternal[EventConstants.SESSION_HEADER] = connectedInfo.sessionId
-
-                            resolve(connectedInfo)
-                        } else {
-                            reject('Server did not return proper data for successful login')
-                        }
-
-                    }else if(typeof connectionInfo.connectHeaders === 'function'){
-                        // If the connect headers are supplied by a function we remove all the header values since they will be recreated on next connect
-                        for (let key in connectHeadersInternal) {
-                            delete connectHeadersInternal[key]
-                        }
-                        if(!this.initialConnectionSuccessful) {
-                            resolve(connectedInfo)
-                        }
-                    }else if(typeof connectionInfo.connectHeaders === 'object'){
-                        // static object we must leave intact for reuse
-                        serverHeadersSubscription.unsubscribe()
-                        resolve(connectedInfo)
+                if (!connectionInfo.disableStickySession) {
+                    if (connectedInfo.sessionId == null || connectedInfo.replyToId == null) {
+                        this.close(new ContinuumError('Server did not return proper data for successful login'), true)
+                            .catch(e => this.debugLogger(`Error closing after bad CONNECTED frame: ${e}`))
+                        return
                     }
-                } else {
-                    reject('Server did not return proper data for successful login')
+                    this.sessionId = connectedInfo.sessionId
+                }
+
+                if (!this.everConnected) {
+                    this.everConnected = true
+                    this.rejectActivation = null
+                    resolve(connectedInfo)
                 }
             })
 
-            this.rxStomp.activate()
+            rxStomp.activate()
         })
     }
 
-    public async deactivate(force?: boolean): Promise<void> {
-        if(this.rxStomp){
-            await this.rxStomp.deactivate({force: force})
-            if(this.deactivationHandler){
-                this.deactivationHandler()
-            }
-            this.rxStomp = null
+    /**
+     * Closes the connection and stops reconnecting. Safe to call at any time: it does nothing when
+     * inactive, and a call that overlaps a close already in progress waits for that one.
+     * @param force if true the socket is discarded rather than closed with a DISCONNECT frame
+     */
+    public deactivate(force?: boolean): Promise<void> {
+        return this.close(undefined, force)
+    }
+
+    public publish(parameters: IRxStompPublishParams): void {
+        this.requireActive().publish(parameters)
+    }
+
+    public watch(cri: string): Observable<IMessage> {
+        return this.requireActive().watch(cri)
+    }
+
+    /**
+     * The one path out of the active state. The `closed` event is emitted only once the manager is
+     * inactive again, so a handler can activate() right away; the activate() promise, if still pending,
+     * is rejected with the same error after that.
+     */
+    private close(error?: ContinuumError, force?: boolean): Promise<void> {
+        if (this.state === 'inactive') {
+            return Promise.resolve()
         }
-        return
+        if (this.closing) {
+            return this.closing
+        }
+        this.state = 'closing'
+        const rxStomp = this.rxStomp!
+        this.closing = (async (): Promise<void> => {
+            try {
+                await rxStomp.deactivate({force: force})
+            } finally {
+                const rejectActivation = this.rejectActivation
+                this.rejectActivation = null
+                this.rxStomp = null
+                this.closing = null
+                this.state = 'inactive'
+                this.eventSubject.next({type: 'closed', error: error})
+                if (rejectActivation) {
+                    rejectActivation(error ?? new ContinuumError('Connection was closed before it was established'))
+                }
+            }
+        })()
+        return this.closing
+    }
+
+    /**
+     * The CONNECT headers for one attempt. With sticky sessions a reconnect presents only the session
+     * the server gave us; the library never holds the caller's credentials past the attempt that used
+     * them. Otherwise the caller's headers are sent - copied if static, called again if a function,
+     * which is what a function is for: credentials that may have changed since the last attempt.
+     */
+    private async connectHeadersForAttempt(connectionInfo: ConnectionInfo): Promise<StompHeaders> {
+        if (this.sessionId != null) {
+            return {[EventConstants.SESSION_HEADER]: this.sessionId}
+        }
+
+        const supplied = typeof connectionInfo.connectHeaders === 'function'
+            ? await connectionInfo.connectHeaders()
+            : connectionInfo.connectHeaders
+        const headers: StompHeaders = {...supplied}
+
+        if (connectionInfo.disableStickySession) {
+            headers[EventConstants.DISABLE_STICKY_SESSION_HEADER] = 'true'
+        }
+
+        // use replyToId if provided in connectionInfo, otherwise set it
+        if (headers[EventConstants.REPLY_TO_ID_HEADER]) {
+            this.replyToId = headers[EventConstants.REPLY_TO_ID_HEADER]
+            this._replyToCri = EventConstants.SERVICE_DESTINATION_PREFIX + this.replyToId + ':' + uuidv4() + '@continuum.js.EventBus/replyHandler'
+        } else {
+            headers[EventConstants.REPLY_TO_ID_HEADER] = this.replyToId
+        }
+        return headers
+    }
+
+    private requireActive(): RxStomp {
+        if (!this.active) {
+            throw new ContinuumError('You must call connect on the event bus before sending any request')
+        }
+        return this.rxStomp!
     }
 
     /**
      * Make sure clients don't all try to reconnect at the same time.
      */
     private async connectionJitterDelay(): Promise<void> {
-        if(this.initialConnectionSuccessful) {
+        if (this.everConnected) {
             const randomJitter = Math.random() * this.JITTER_MAX;
             this.debugLogger(`Adding ${randomJitter}ms of jitter delay`)
             return new Promise(resolve => setTimeout(resolve, randomJitter));
