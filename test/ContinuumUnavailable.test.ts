@@ -1,6 +1,6 @@
 import {describe, expect, it} from 'vitest'
 import {WebSocket} from 'ws'
-import {ConnectedInfo, ConnectionInfo, Continuum, ContinuumSingleton} from '../src'
+import {ConnectedInfo, ConnectionInfo, ConnectionLostError, Continuum, ContinuumSingleton} from '../src'
 import { GenericContainer, PullPolicy, StartedTestContainer, Wait } from 'testcontainers'
 import {TestService} from './ITestService.js'
 import { logFailure, validateConnectedInfo } from './TestHelper'
@@ -39,10 +39,10 @@ describe('Continuum Unavailable Tests', () => {
            // Start the Continuum Gateway container
            console.log('Starting Continuum Gateway for sticky session gateway restart reconnection test')
 
-           container = await new GenericContainer('mindignited/continuum-gateway-server:latest')
+           container = await new GenericContainer((process.env.CONTINUUM_GATEWAY_IMAGE || 'mindignited/continuum-gateway-server:latest'))
                .withExposedPorts({container: 58503, host: 58590})
                .withEnvironment({SPRING_PROFILES_ACTIVE: "clienttest"})
-               .withPullPolicy(PullPolicy.alwaysPull())
+               .withPullPolicy(process.env.CONTINUUM_GATEWAY_IMAGE ? PullPolicy.defaultPolicy() : PullPolicy.alwaysPull())
                .withWaitStrategy(Wait.forHttp('/', 58503))
                .withName('maxretries-container')
                .start()
@@ -66,7 +66,8 @@ describe('Continuum Unavailable Tests', () => {
            // stop the gateway
            await container.stop()
 
-           await expect(testService.testMethodWithString("Bob")).rejects.toThrowError(new Error('Connection disconnected'))
+           // Failed with the typed error a caller can tell apart from a server answer; the message is unchanged
+           await expect(testService.testMethodWithString("Bob")).rejects.toThrowError(new ConnectionLostError('Connection disconnected'))
 
            await continuum.disconnect()
 
