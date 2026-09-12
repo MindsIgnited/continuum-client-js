@@ -1,7 +1,7 @@
 import {ConnectionInfo} from '@/api/ConnectionInfo'
 import {ConnectedInfo} from '@/api/security/ConnectedInfo'
 import {EventConstants} from '@/core/api/IEventBus'
-import {IFrame, RxStomp, RxStompConfig, StompHeaders} from '@stomp/rx-stomp'
+import {IFrame, RxStomp, RxStompConfig, RxStompState, StompHeaders} from '@stomp/rx-stomp'
 import {ReconnectionTimeMode} from '@stomp/stompjs'
 import {Subscription} from 'rxjs'
 import {v4 as uuidv4} from 'uuid'
@@ -28,6 +28,20 @@ export class StompConnectionManager {
     private replyToId = uuidv4()
     public _replyToCri =  EventConstants.SERVICE_DESTINATION_PREFIX + this.replyToId + ':' + uuidv4() + '@continuum.js.EventBus/replyHandler'
     public deactivationHandler: (() => void) | null = null
+    /**
+     * Invoked each time an established connection's socket closes, before any reconnect attempt.
+     * Anything in flight on the old socket cannot complete, so this is where it is failed.
+     */
+    public connectionLostHandler: (() => void) | null = null
+    /**
+     * The ERROR frame that caused the most recent teardown, if that is why it happened. Set before
+     * deactivate() runs so the deactivation handler can report it once the connection is actually down.
+     */
+    public lastRefusal: IFrame | null = null
+    /** True once a CONNECTED frame has ever been received on this activation. */
+    public get initialConnectionSucceeded(): boolean {
+        return this.initialConnectionSuccessful
+    }
 
     /**
      * @return true if this {@link StompConnectionManager} is actively trying to maintain a connection to the Stomp server, false if not.
@@ -71,6 +85,7 @@ export class StompConnectionManager {
             this.initialConnectionSuccessful = false
             this.lastWebsocketError = null
             this.maxConnectionAttemptsReached = false
+            this.lastRefusal = null
 
             const url = 'ws' + (connectionInfo.useSSL ? 's' : '')
                 + '://' + connectionInfo.host
@@ -78,7 +93,13 @@ export class StompConnectionManager {
 
             this.rxStomp = new RxStomp()
 
-            let connectHeadersInternal: StompHeaders = (typeof connectionInfo.connectHeaders !== 'function' && connectionInfo.connectHeaders != null ? connectionInfo.connectHeaders : {})
+            // Work on a copy. The sticky session path below replaces the credentials in this map with the
+            // session id, and doing that to the caller's own object silently stripped its credentials -
+            // so after a refused reconnect the caller could not connect again with the same ConnectionInfo,
+            // which is precisely what it is expected to do.
+            let connectHeadersInternal: StompHeaders = (typeof connectionInfo.connectHeaders !== 'function' && connectionInfo.connectHeaders != null
+                ? {...connectionInfo.connectHeaders}
+                : {})
 
             const stompConfig: RxStompConfig = {
                 brokerURL: url,
@@ -158,13 +179,31 @@ export class StompConnectionManager {
                 }
             })
 
-            // This subscription is to handle any errors that occur during connection
+            // A STOMP ERROR frame means the server refused us - on the initial connect, or on a later
+            // reconnect presenting a session the server no longer has. Either way the library cannot
+            // recover on its own: it holds no credentials, only the session id that was just refused.
+            // So it tears down through deactivate(), which runs the deactivation handler so pending
+            // requests are failed and the fatal error is surfaced, and leaves reconnecting to the caller.
+            // Previously this called rxStomp.deactivate() directly, which skipped that handler and left
+            // the client silently dead with every in-flight request waiting forever.
             const errorSubscription: Subscription = this.rxStomp.stompErrors$.subscribe((value: IFrame) => {
                 errorSubscription.unsubscribe()
                 const message = value.headers['message']
-                this.rxStomp?.deactivate()
-                this.rxStomp = null
-                reject(message)
+                this.lastRefusal = value
+                void this.deactivate().finally(() => reject(message))
+            })
+
+            // Fail whatever was in flight the moment the socket closes. The reply address is per
+            // connection and the server that held the request may be gone, so those replies are not
+            // coming; a clean failure now beats a reply that sometimes sneaks through after reconnect.
+            let wasOpen = false
+            this.rxStomp.connectionState$.subscribe((state: RxStompState) => {
+                if (state === RxStompState.OPEN) {
+                    wasOpen = true
+                } else if (wasOpen && (state === RxStompState.CLOSING || state === RxStompState.CLOSED)) {
+                    wasOpen = false
+                    this.connectionLostHandler?.()
+                }
             })
 
             // This is triggered when the server sends a CONNECTED frame.

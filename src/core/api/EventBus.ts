@@ -16,6 +16,8 @@
  */
 
 import {ConnectionInfo, ServerInfo} from '@/api/ConnectionInfo'
+import {AuthenticationError} from '@/api/errors/AuthenticationError'
+import {ConnectionLostError} from '@/api/errors/ConnectionLostError'
 import {ContinuumError} from '@/api/errors/ContinuumError'
 import {ConnectedInfo} from '@/api/security/ConnectedInfo'
 import {StompConnectionManager} from '@/core/api/StompConnectionManager'
@@ -89,30 +91,50 @@ interface Carrier {
  */
 export class EventBus implements IEventBus {
 
-    public fatalErrors: Observable<Error>
+    /**
+     * Emits when the connection has been torn down by something other than a call to disconnect:
+     * the server refused a connect or a reconnect. By then the connection is already deactivated and
+     * every pending request has been failed; what remains is the caller's decision on whether and how
+     * to connect again. This is hot - it emits whether or not anyone is subscribed - so a subscription
+     * added after the fact will not replay a loss that has already happened.
+     */
+    public readonly fatalErrors: Observable<ContinuumError>
     public serverInfo: ServerInfo | null = null
     private stompConnectionManager: StompConnectionManager = new StompConnectionManager()
     private replyToCri: string  | null = null
     private requestRepliesObservable: ConnectableObservable<IEvent> | null = null
     private requestRepliesSubject: Subject<IEvent> | null = null
     private requestRepliesSubscription: Subscription | null = null
-    private errorSubject: Subject<IFrame> = new Subject<IFrame>()
-    private errorSubjectSubscription: Subscription | null | undefined = null
+    private fatalErrorSubject: Subject<ContinuumError> = new Subject<ContinuumError>()
 
     constructor() {
-        this.fatalErrors = this.errorSubject
-                               .pipe(map<IFrame, Error>((frame: IFrame): Error => {
-                                   this.disconnect()
-                                       .catch((error: string) => {
-                                           if(console){
-                                               console.error('Error disconnecting from Stomp: ' + error)
-                                           }
-                                       })
-                                   // TODO: map to continuum error
-                                   return new ContinuumError(frame.headers['message'])
-                               }))
+        this.fatalErrors = this.fatalErrorSubject.asObservable()
+        // The manager tears the connection down on a refused connect, and when the caller's bound on
+        // reconnect attempts is exhausted; this runs as part of both. The refusal is reported from the
+        // ERROR frame itself, so only the exhausted bound needs reporting here - once the initial connect
+        // has succeeded there is no promise left to reject, and without this it would end in silence.
         this.stompConnectionManager.deactivationHandler = () => {
+            const manager = this.stompConnectionManager
+            const refusal = manager.lastRefusal
+            const attemptsExhausted = manager.maxConnectionAttemptsReached
+            // Only a loss after a working connection is reported here. A refused initial connect
+            // already reaches the caller as the rejected connect() promise, exactly as before.
+            const report = manager.initialConnectionSucceeded
             this.cleanup()
+            if (!report) {
+                return
+            }
+            if (refusal) {
+                this.fatalErrorSubject.next(EventBus.toFatalError(refusal))
+            } else if (attemptsExhausted) {
+                this.fatalErrorSubject.next(new ContinuumError(
+                    'Max connection attempts reached; the connection has been given up on'))
+            }
+        }
+        // The socket dropping fails what was in flight. Reconnection, if any, carries on underneath
+        this.stompConnectionManager.connectionLostHandler = () => {
+            this.failPendingRequests(new ConnectionLostError(
+                'Connection to the server was lost while this request was in flight; it will not receive a reply'))
         }
     }
 
@@ -140,7 +162,6 @@ export class EventBus implements IEventBus {
             // FIXME: a reply should not need a reply, therefore a replyCri probably should not be a EventConstants.SERVICE_DESTINATION_PREFIX
             this.replyToCri = this.stompConnectionManager.replyToCri
 
-            this.errorSubjectSubscription = this.stompConnectionManager.rxStomp?.stompErrors$.subscribe(this.errorSubject)
 
             return connectedInfo
         }else{
@@ -266,26 +287,37 @@ export class EventBus implements IEventBus {
     }
 
     private cleanup(): void{
-        if (this.requestRepliesSubject != null) {
+        this.failPendingRequests(new ConnectionLostError('Connection disconnected'))
 
-            // This will be sent to any client waiting on an Event
-            this.requestRepliesSubject.error(new Error('Connection disconnected'))
+        this.serverInfo = null
+    }
+
+    /**
+     * Fails every request currently waiting on a reply and discards the reply subscription. The next
+     * request recreates it on demand, so this is safe to call whether or not a reconnect follows.
+     */
+    private failPendingRequests(error: ConnectionLostError): void {
+        if (this.requestRepliesSubject != null) {
+            // Delivered to every caller waiting on an Event
+            this.requestRepliesSubject.error(error)
 
             if (this.requestRepliesSubscription != null) {
                 this.requestRepliesSubscription.unsubscribe()
                 this.requestRepliesSubscription = null
             }
 
-            this.requestRepliesSubject = null;
+            this.requestRepliesSubject = null
             this.requestRepliesObservable = null
         }
+    }
 
-        if (this.errorSubjectSubscription) {
-            this.errorSubjectSubscription.unsubscribe()
-            this.errorSubjectSubscription = null
+    private static toFatalError(frame: IFrame): ContinuumError {
+        const message: string = frame.headers['message'] ?? 'Connection refused by server'
+        // The gateway reports a refused credential or session as an authentication failure
+        if (/authenticat/i.test(message)) {
+            return new AuthenticationError(message)
         }
-
-        this.serverInfo = null
+        return new ContinuumError(message)
     }
 
     /**
