@@ -36,9 +36,10 @@ Object.assign(global, { WebSocket})
  *   ./gradlew :continuum-gateway-server:bootBuildImage
  *   docker tag mindsignited/continuum-gateway-server:3.1.0-SNAPSHOT mindsignited/continuum-gateway-server:3.1.0-SNAPSHOT-local
  */
-// A local-only tag on purpose: CI publishes 3.1.0-SNAPSHOT to Docker Hub, and a test that pulls would
-// replace a local build carrying fixes not yet on develop with whatever CI last published
-const GATEWAY_IMAGE = process.env.CONTINUUM_GATEWAY_IMAGE || 'mindsignited/continuum-gateway-server:3.1.0-SNAPSHOT-local'
+// The public snapshot continuum CI publishes on every push to develop. To test against a gateway built
+// locally instead, tag it and pass CONTINUUM_GATEWAY_IMAGE; a supplied image is never pulled, so a local
+// build is not replaced by whatever CI last published
+const GATEWAY_IMAGE = process.env.CONTINUUM_GATEWAY_IMAGE || 'mindsignited/continuum-gateway-server:3.1.0-SNAPSHOT'
 const HOST_PORT = 58598
 // The clienttest service as develop publishes it
 const TEST_SERVICE_CRI = 'org.kinotic.continuum.gatewayserver.clienttest.ITestService'

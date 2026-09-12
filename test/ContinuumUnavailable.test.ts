@@ -39,7 +39,7 @@ describe('Continuum Unavailable Tests', () => {
            // Start the Continuum Gateway container
            console.log('Starting Continuum Gateway for sticky session gateway restart reconnection test')
 
-           container = await new GenericContainer((process.env.CONTINUUM_GATEWAY_IMAGE || 'mindignited/continuum-gateway-server:latest'))
+           container = await new GenericContainer((process.env.CONTINUUM_GATEWAY_IMAGE || 'mindsignited/continuum-gateway-server:3.1.0-SNAPSHOT'))
                .withExposedPorts({container: 58503, host: 58590})
                .withEnvironment({SPRING_PROFILES_ACTIVE: "clienttest"})
                .withPullPolicy(process.env.CONTINUUM_GATEWAY_IMAGE ? PullPolicy.defaultPolicy() : PullPolicy.alwaysPull())

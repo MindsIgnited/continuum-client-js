@@ -11,7 +11,7 @@ export async function setup(project: TestProject) {
     if(import.meta.env.VITE_USE_GATEWAY_DOCKER === 'true') {
         console.log('Starting Continuum Gateway')
 
-        container = await new GenericContainer((process.env.CONTINUUM_GATEWAY_IMAGE || 'mindignited/continuum-gateway-server:latest'))
+        container = await new GenericContainer((process.env.CONTINUUM_GATEWAY_IMAGE || 'mindsignited/continuum-gateway-server:3.1.0-SNAPSHOT'))
             .withExposedPorts(58503)
             .withEnvironment({SPRING_PROFILES_ACTIVE: "clienttest"})
             .withPullPolicy(process.env.CONTINUUM_GATEWAY_IMAGE ? PullPolicy.defaultPolicy() : PullPolicy.alwaysPull())
