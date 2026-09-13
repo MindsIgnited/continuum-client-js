@@ -23,7 +23,7 @@ import {StompConnectionManager} from '@/core/api/StompConnectionManager'
 import {context, propagation} from '@opentelemetry/api';
 import {IMessage} from '@stomp/rx-stomp'
 import {ConnectableObservable, firstValueFrom, Observable, Subject, Subscription, throwError, Unsubscribable} from 'rxjs'
-import {filter, map, multicast} from 'rxjs/operators'
+import {filter, map, multicast, share} from 'rxjs/operators'
 import {Optional} from 'typescript-optional'
 import {v4 as uuidv4} from 'uuid'
 import {EventConstants, IEvent, IEventBus} from './IEventBus'
@@ -266,6 +266,9 @@ export class EventBus implements IEventBus {
                     const controlEvent: Event = new Event(event.cri)
                     controlEvent.setHeader(EventConstants.CONTROL_HEADER, EventConstants.CONTROL_VALUE_CANCEL)
                     controlEvent.setHeader(EventConstants.CORRELATION_ID_HEADER, correlationId)
+                    // A gateway with nothing to cancel - the service is gone - answers on the reply-to.
+                    // Without one it has no way to say so except an ERROR that ends the connection.
+                    controlEvent.setHeader(EventConstants.REPLY_TO_HEADER, this.replyToCri as string)
                     this.send(controlEvent)
                 }
             }
@@ -321,13 +324,11 @@ export class EventBus implements IEventBus {
      * @return the cold {@link Observable<IEvent>} for the given destination
      */
     private _observe(cri: string): Observable<IEvent> {
-        if(!this.stompConnectionManager.active) {
-            throw this.createSendUnavailableError()
-        }
+        // Shared, so that one result subscribed many times is one subscription on the wire, as
+        // rx-stomp's own watch() is
         return new Observable<IEvent>((subscriber) => {
             let current: Subscription | null = null
             const attach = (): void => {
-                current?.unsubscribe()
                 // Forwarded through a plain observer: handed the subscriber itself, RxJS would use it as
                 // the inner subscription, and detaching from a closed connection would end the caller's too
                 current = this.stompConnectionManager
@@ -339,7 +340,13 @@ export class EventBus implements IEventBus {
                                              complete: () => subscriber.complete()
                                          })
             }
-            attach()
+            // Attached to the connection there is, if there is one; otherwise to the next one. Once
+            // attached, it stays attached until that connection closes: rx-stomp re-subscribes within a
+            // connection by itself, and a subscription made while connect() was pending was made by it
+            // as the client came up, so connect() resolving is not a reason to make it again.
+            if (this.stompConnectionManager.active) {
+                attach()
+            }
             const following = new Subscription()
             following.add(this.stompConnectionManager.events.subscribe(event => {
                 if (event.type === 'closed') {
@@ -347,12 +354,16 @@ export class EventBus implements IEventBus {
                     current = null
                 }
             }))
-            following.add(this.activated.subscribe(() => attach()))
+            following.add(this.activated.subscribe(() => {
+                if (current == null) {
+                    attach()
+                }
+            }))
             return () => {
                 following.unsubscribe()
                 current?.unsubscribe()
             }
-        })
+        }).pipe(share())
     }
 
     /** We translate all IMessage objects to IEvent objects */

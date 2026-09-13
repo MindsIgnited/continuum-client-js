@@ -38,6 +38,10 @@ export class StompConnectionManager {
     private readonly INITIAL_RECONNECT_DELAY: number = 2000
     private readonly MAX_RECONNECT_DELAY: number = 120000 // 2 mins
     private readonly JITTER_MAX: number = 5000
+    /** How long a single attempt may take to reach CONNECTED before it is abandoned, unless the caller says otherwise */
+    private readonly DEFAULT_CONNECT_TIMEOUT_MS: number = 10000
+    /** How long a polite close waits for the peer's part in it before the socket is simply discarded */
+    private readonly POLITE_CLOSE_GRACE_MS: number = 5000
     private debugLogger = debug('continuum:stomp')
 
     private state: 'inactive' | 'active' | 'closing' = 'inactive'
@@ -46,6 +50,8 @@ export class StompConnectionManager {
     private closing: Promise<void> | null = null
     /** Why the teardown in progress is happening, if it has a reason; an overlapping close may supply one */
     private closingError: ContinuumError | undefined = undefined
+    /** Whether the teardown in progress was asked for by the caller, in which case nothing that happens during it is a reason */
+    private closeRequested: boolean = false
     /** Rejects the activate() promise, until the first CONNECTED frame settles it */
     private rejectActivation: ((error: ContinuumError) => void) | null = null
 
@@ -110,6 +116,14 @@ export class StompConnectionManager {
         const url = 'ws' + (connectionInfo.useSSL ? 's' : '')
             + '://' + connectionInfo.host
             + (connectionInfo.port ? ':' + connectionInfo.port : '') + '/v1'
+        // The WebSocket constructor throws on a bad URL, from inside a stompjs call nothing awaits, and
+        // the attempt would neither fail nor proceed. Refused here instead, before anything is started.
+        try {
+            new URL(url)
+        } catch (e) {
+            this.state = 'inactive'
+            return Promise.reject(new ContinuumError(`Invalid connection URL ${url}: ${(e as Error).message}`))
+        }
 
         const rxStomp = new RxStomp()
         this.rxStomp = rxStomp
@@ -117,12 +131,22 @@ export class StompConnectionManager {
         return new Promise((resolve, reject): void => {
             this.rejectActivation = reject
 
+            // This runs inside stompjs on the activation that scheduled it; if the manager has moved on
+            // to another activation while it was waiting, whatever it was about to do is no longer wanted
+            const abandoned = (): boolean => this.rxStomp !== rxStomp
+
             const stompConfig: RxStompConfig = {
                 brokerURL: url,
                 heartbeatIncoming: 120000,
                 heartbeatOutgoing: 30000,
                 reconnectDelay: this.INITIAL_RECONNECT_DELAY,
+                // A peer that accepts the socket and then says nothing would otherwise hold the attempt
+                // open forever; past this stompjs abandons it and it counts as a failed attempt
+                connectionTimeout: connectionInfo.connectTimeoutMs ?? this.DEFAULT_CONNECT_TIMEOUT_MS,
                 beforeConnect: async (): Promise<void> => {
+                    if (abandoned()) {
+                        return
+                    }
                     // If max connections are set then make sure we have not exceeded that threshold
                     if (connectionInfo.maxConnectionAttempts) {
                         this.connectionAttempts++
@@ -133,15 +157,33 @@ export class StompConnectionManager {
                         }
                     }
                     await this.connectionJitterDelay()
+                    if (abandoned()) {
+                        return
+                    }
                     // Headers are built fresh for every attempt, so nothing is ever mutated: not the
                     // caller's object, and not what an earlier attempt sent. A caller's function that
                     // cannot answer ends the connection rather than the attempt: stompjs does not catch
                     // what escapes from here, and a rejection would leave everything hanging, still active.
+                    let headers: StompHeaders
                     try {
-                        rxStomp.stompClient.connectHeaders = await this.connectHeadersForAttempt(connectionInfo)
+                        headers = await this.connectHeadersForAttempt(connectionInfo)
                     } catch (e: any) {
-                        await this.close(new ContinuumError(`connectHeaders could not be produced: ${e?.message ?? e}`))
+                        if (!abandoned()) {
+                            await this.close(new ContinuumError(`connectHeaders could not be produced: ${e?.message ?? e}`))
+                        }
+                        return
                     }
+                    if (abandoned()) {
+                        return
+                    }
+                    // use replyToId if provided in connectionInfo, otherwise set it
+                    if (headers[EventConstants.REPLY_TO_ID_HEADER]) {
+                        this.replyToId = headers[EventConstants.REPLY_TO_ID_HEADER]
+                        this._replyToCri = EventConstants.SERVICE_DESTINATION_PREFIX + this.replyToId + ':' + uuidv4() + '@continuum.js.EventBus/replyHandler'
+                    } else {
+                        headers[EventConstants.REPLY_TO_ID_HEADER] = this.replyToId
+                    }
+                    rxStomp.stompClient.connectHeaders = headers
                 }
             }
 
@@ -225,6 +267,11 @@ export class StompConnectionManager {
      * @param force if true the socket is discarded rather than closed with a DISCONNECT frame
      */
     public deactivate(force?: boolean): Promise<void> {
+        // From here on, the reason the connection ends is that it was asked to; whatever the server
+        // says on the way out - an ERROR for something it was still processing, say - is not one
+        if (this.state === 'active') {
+            this.closeRequested = true
+        }
         return this.close(undefined, force)
     }
 
@@ -247,11 +294,14 @@ export class StompConnectionManager {
         }
         const rxStomp = this.rxStomp!
         if (this.closing) {
-            // A close that overlaps one in progress adds what it knows. A reason, if the first had none:
-            // an ERROR frame arriving during a polite close is still the reason it ended. And force, which
-            // stompjs honours while already deactivating - a polite close waiting on a peer that will
-            // never answer is exactly what a forced one is for.
-            this.closingError ??= error
+            // A close that overlaps one in progress adds what it knows. A reason, if the first had none
+            // and was not the caller's own request: an ERROR frame arriving during a close the server
+            // initiated is still the reason it ended. And force, which stompjs honours while already
+            // deactivating - a polite close waiting on a peer that will never answer is exactly what a
+            // forced one is for.
+            if (!this.closeRequested) {
+                this.closingError ??= error
+            }
             if (force) {
                 rxStomp.deactivate({force: true})
                        .catch(e => this.debugLogger(`Error forcing a close already in progress: ${e}`))
@@ -259,15 +309,16 @@ export class StompConnectionManager {
             return this.closing
         }
         this.state = 'closing'
-        this.closingError = error
+        this.closingError = this.closeRequested ? undefined : error
         this.closing = (async (): Promise<void> => {
             try {
-                await rxStomp.deactivate({force: force})
+                await this.deactivateWithinGrace(rxStomp, force)
             } finally {
                 const rejectActivation = this.rejectActivation
                 const closedWith = this.closingError
                 this.rejectActivation = null
                 this.closingError = undefined
+                this.closeRequested = false
                 this.rxStomp = null
                 this.closing = null
                 this.state = 'inactive'
@@ -278,6 +329,30 @@ export class StompConnectionManager {
             }
         })()
         return this.closing
+    }
+
+    /**
+     * A polite close - DISCONNECT, then wait for the RECEIPT and the socket's own close - is owed to a
+     * server holding a session, but a peer that never does its part does not get to hold the caller
+     * on it. Past the grace period the socket is discarded and the same promise settles.
+     */
+    private async deactivateWithinGrace(rxStomp: RxStomp, force?: boolean): Promise<void> {
+        const closing = rxStomp.deactivate({force: force})
+        if (force) {
+            return closing
+        }
+        let graceTimer: ReturnType<typeof setTimeout> | undefined
+        const graceExpired = new Promise<boolean>(resolve => {
+            graceTimer = setTimeout(() => resolve(true), this.POLITE_CLOSE_GRACE_MS)
+        })
+        const timedOut = await Promise.race([closing.then(() => false, () => false), graceExpired])
+        clearTimeout(graceTimer)
+        if (timedOut) {
+            this.debugLogger(`Polite close not completed within ${this.POLITE_CLOSE_GRACE_MS}ms, discarding the socket`)
+            rxStomp.deactivate({force: true})
+                   .catch(e => this.debugLogger(`Error discarding the socket after the grace period: ${e}`))
+        }
+        return closing
     }
 
     /**
@@ -300,9 +375,16 @@ export class StompConnectionManager {
         }
         let connectedInfo: ConnectedInfo
         try {
-            connectedInfo = JSON.parse(connectedInfoJson)
+            // STOMP 1.2 says CONNECTED is not escaped, and stompjs takes it at its word. The gateway's
+            // codec (vertx-stomp-lite HeaderCodec.encode) nonetheless doubles every backslash in the
+            // value, which leaves any JSON escape in it - a quote in a participant's name, say - unreadable
+            // until that is undone.
+            connectedInfo = JSON.parse(connectedInfoJson.replace(/\\\\/g, '\\'))
         } catch (e) {
             this.debugLogger(`Unreadable ${EventConstants.CONNECTED_INFO_HEADER} header: ${e}`)
+            return null
+        }
+        if (connectedInfo == null || typeof connectedInfo !== 'object') {
             return null
         }
         if (!connectionInfo.disableStickySession && (connectedInfo.sessionId == null || connectedInfo.replyToId == null)) {
@@ -329,14 +411,6 @@ export class StompConnectionManager {
 
         if (connectionInfo.disableStickySession) {
             headers[EventConstants.DISABLE_STICKY_SESSION_HEADER] = 'true'
-        }
-
-        // use replyToId if provided in connectionInfo, otherwise set it
-        if (headers[EventConstants.REPLY_TO_ID_HEADER]) {
-            this.replyToId = headers[EventConstants.REPLY_TO_ID_HEADER]
-            this._replyToCri = EventConstants.SERVICE_DESTINATION_PREFIX + this.replyToId + ':' + uuidv4() + '@continuum.js.EventBus/replyHandler'
-        } else {
-            headers[EventConstants.REPLY_TO_ID_HEADER] = this.replyToId
         }
         return headers
     }
