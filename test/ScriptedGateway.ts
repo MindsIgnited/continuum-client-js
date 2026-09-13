@@ -21,7 +21,7 @@ export interface Frame {
 
 export type ConnectDecision =
     /** A normal CONNECTED carrying connected-info, with the session id given or a fresh one */
-    | { accept: true, sessionId?: string }
+    | { accept: true, sessionId?: string, participant?: { id?: string, roles?: string[], metadata?: Record<string, string> } }
     /** An ERROR frame with this message, then the socket is closed - what a refused connect looks like */
     | { refuse: string }
     /** A CONNECTED with exactly these headers and nothing added, for the malformed cases */
@@ -63,8 +63,10 @@ export class GatewayConnection {
         if (this.socket.readyState !== ServerSocket.OPEN) {
             return
         }
-        // STOMP 1.2 escapes header values everywhere except the CONNECT and CONNECTED frames
-        const escape = command === 'CONNECTED' ? (v: string) => v : escapeHeaderValue
+        // STOMP 1.2 escapes header values everywhere except the CONNECT and CONNECTED frames. The
+        // gateway's codec (vertx-stomp-lite HeaderCodec.encode) nonetheless doubles every backslash in
+        // a CONNECTED value, and the client has to live with what the gateway actually sends.
+        const escape = command === 'CONNECTED' ? escapeConnectedLikeTheGateway : escapeHeaderValue
         const headerLines = Object.entries(headers).map(([k, v]) => `${k}:${escape(v)}`).join('\n')
         this.socket.send(`${command}\n${headerLines}\n\n${body}\0`)
     }
@@ -109,8 +111,17 @@ export class ScriptedGateway {
     public readonly connections: GatewayConnection[] = []
     /** Sessions this gateway remembers; clear it to become an instance with no memory of any session */
     public readonly sessions = new Set<string>()
-    /** Whether a DISCONNECT gets its RECEIPT. A server that never answers is the half-open peer */
-    public ackDisconnect: boolean = true
+    /**
+     * What a DISCONNECT gets back: its RECEIPT, nothing at all - the half-open peer - or an ERROR, which
+     * the gateway sends when something it was still processing for the connection fails
+     */
+    public onDisconnect: 'ack' | 'ignore' | 'error' = 'ack'
+    /**
+     * Destinations with a handler, as a service registered on the gateway would be. Anything sent
+     * elsewhere is answered the way the gateway answers a request nothing handles: with an error reply
+     * to the reply-to if there is one, and with an ERROR frame that ends the connection if there is not
+     */
+    public readonly handlers = new Map<string, (frame: Frame, connection: GatewayConnection) => void>()
     /**
      * How a CONNECT is answered. The default is the gateway's sticky session logic: a session header is
      * accepted only if the session is remembered, anything else gets a fresh session.
@@ -207,7 +218,11 @@ export class ScriptedGateway {
                     const connectedInfo = {
                         sessionId,
                         replyToId: frame.headers['reply-to-id'] ?? uuidv4(),
-                        participant: {id: frame.headers['login'] ?? 'session', roles: ['ADMIN'], metadata: {}}
+                        participant: {
+                            id: decision.participant?.id ?? frame.headers['login'] ?? 'session',
+                            roles: decision.participant?.roles ?? ['ADMIN'],
+                            metadata: decision.participant?.metadata ?? {}
+                        }
                     }
                     connection.send('CONNECTED', {
                         version: '1.2',
@@ -224,10 +239,25 @@ export class ScriptedGateway {
                 connection.subscriptions.delete(frame.headers['id'])
                 break
             case 'DISCONNECT':
-                if (this.ackDisconnect && frame.headers['receipt']) {
+                if (this.onDisconnect === 'ack' && frame.headers['receipt']) {
                     connection.send('RECEIPT', {'receipt-id': frame.headers['receipt']})
+                } else if (this.onDisconnect === 'error') {
+                    connection.sendError('Request failed while the connection was closing')
                 }
                 break
+            case 'SEND': {
+                const handler = this.handlers.get(frame.headers['destination'])
+                if (handler) {
+                    handler(frame, connection)
+                } else if (frame.headers['reply-to']) {
+                    connection.sendMessage(frame.headers['reply-to'],
+                                           {error: `No handler for ${frame.headers['destination']}`,
+                                            '__correlation-id': frame.headers['__correlation-id']})
+                } else {
+                    connection.sendError(`No handler for ${frame.headers['destination']} and no reply-to to say so`)
+                }
+                break
+            }
             default:
                 break
         }
@@ -261,6 +291,10 @@ function parseFrames(data: RawData): Frame[] {
         }
     }
     return [{command, headers, body}]
+}
+
+function escapeConnectedLikeTheGateway(value: string): string {
+    return value.replace(/\\/g, '\\\\')
 }
 
 function escapeHeaderValue(value: string): string {

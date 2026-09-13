@@ -57,6 +57,13 @@ export class ConnectionInfo extends ServerInfo {
     maxConnectionAttempts?: number | null
 
     /**
+     * How long a single connection attempt may take to reach a CONNECTED frame before it is abandoned
+     * and counted as a failed attempt. This bounds a peer that accepts the socket but never completes the
+     * handshake. Default 10 seconds; set higher for slow networks.
+     */
+    connectTimeoutMs?: number | null
+
+    /**
      * If true, the session will not be kept alive after the connection is established and then disrupted.
      * If false, the session will be kept alive after the connection is established and then disrupted, for a period of time.
      */

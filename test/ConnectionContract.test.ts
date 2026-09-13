@@ -1,4 +1,5 @@
 import {afterEach, beforeEach, describe, expect, it} from 'vitest'
+import {createServer, Server, Socket} from 'node:net'
 import {WebSocket} from 'ws'
 import {IFrame} from '@stomp/rx-stomp'
 import {
@@ -46,7 +47,7 @@ describe('Connection contract', () => {
     it('disconnect(true) breaks a graceful close the server is not answering', {timeout: 30000}, async () => {
         // A half-open peer: DISCONNECT goes out, the RECEIPT never comes back, and without heartbeats the
         // graceful close waits on it indefinitely. A forced close is the caller's only way out.
-        gateway.ackDisconnect = false
+        gateway.onDisconnect = 'ignore'
         await continuum.connect(connectionInfo())
         const connection = await gateway.waitForConnection(0)
 
@@ -63,7 +64,11 @@ describe('Connection contract', () => {
     it('a stream interrupted by a socket loss still cancels its invocation once reconnected', {timeout: 60000}, async () => {
         // With a sticky session the server keeps the invocation running across the socket loss and keeps
         // producing into the reply address. The stream is failed on the client, so its cancel must still
-        // reach the server, on the connection that replaces the lost one.
+        // reach the server, on the connection that replaces the lost one - and must be a cancel the
+        // gateway can answer: one without a reply-to is answered with an ERROR that ends the connection.
+        gateway.handlers.set('srv://com.example.Svc/watch', () => { /* a long-running stream: never answers */ })
+        const fatal: ContinuumError[] = []
+        continuum.eventBus.fatalErrors.subscribe(e => fatal.push(e))
         await continuum.connect(connectionInfo())
         const first = await gateway.waitForConnection(0)
 
@@ -79,11 +84,15 @@ describe('Connection contract', () => {
         await second.waitForFrame(f => f.command === 'CONNECT', 10000, 'the reconnect')
         expect(second.frames[0].headers['session'], 'the reconnect presents the session the invocation lives in').toBe(first.sessionId)
 
-        await second.waitForFrame(f => f.command === 'SEND'
-                                       && f.headers['control'] === 'cancel'
-                                       && f.headers['__correlation-id'] === correlationId,
-                                  10000, 'the cancel for the failed stream')
+        const cancel = await second.waitForFrame(f => f.command === 'SEND'
+                                                      && f.headers['control'] === 'cancel'
+                                                      && f.headers['__correlation-id'] === correlationId,
+                                                 10000, 'the cancel for the failed stream')
         expect(streamError).toBeInstanceOf(ConnectionLostError)
+        expect(cancel.headers['reply-to'], 'a cancel carries a reply-to, so a gateway with nothing to cancel can answer it politely').toBeDefined()
+        await sleep(500)
+        expect(fatal, 'the recovered connection survives its own cancel').toEqual([])
+        expect(continuum.eventBus.isConnected()).toBe(true)
     })
 
     it('a CONNECTED frame without connected-info is refused politely, even where terminate() is synchronous', {timeout: 30000}, async () => {
@@ -105,7 +114,12 @@ describe('Connection contract', () => {
         try {
             gateway.onConnect = () => ({connectedHeaders: {version: '1.2', 'heart-beat': '0,0'}})
 
-            await expect(settles(continuum.connect(connectionInfo()), 10000)).rejects.toThrow(/proper data/)
+            // Something has to be watching when CONNECTED arrives: rx-stomp subscribes it as it brings the
+            // client up, and a teardown that runs synchronously from inside that would pull the client out
+            // from under it
+            const connecting = continuum.connect(connectionInfo())
+            continuum.serviceRegistry.register(new ServiceIdentifier('com.example', 'Watcher'), {noop: () => undefined})
+            await expect(settles(connecting, 10000)).rejects.toThrow(/proper data/)
             expect(continuum.eventBus.isConnectionActive()).toBe(false)
             const connection = await gateway.waitForConnection(0)
             await connection.waitForFrame(f => f.command === 'DISCONNECT', 5000, 'a DISCONNECT for the session it accepted')
@@ -123,9 +137,12 @@ describe('Connection contract', () => {
         // That is a claim about what it holds, so this looks at what it holds.
         await continuum.connect(connectionInfo())
         const manager = (continuum.eventBus as any).stompConnectionManager
-        const held: Record<string, string> = manager.rxStomp.stompClient.connectHeaders
-        expect(Object.keys(held), 'the credentials that opened the session must not outlive the attempt that used them')
-            .not.toEqual(expect.arrayContaining(['login', 'passcode']))
+        const client = manager.rxStomp.stompClient
+        // stompjs's handler keeps its own reference to the headers it sent, so both are checked
+        for (const held of [client.connectHeaders, client._stompHandler.connectHeaders] as Record<string, string>[]) {
+            expect(Object.keys(held), 'the credentials that opened the session must not outlive the attempt that used them')
+                .not.toEqual(expect.arrayContaining(['login', 'passcode']))
+        }
     })
 
     it('maxConnectionAttempts bounds each reconnect, not the life of the connection', {timeout: 60000}, async () => {
@@ -217,6 +234,151 @@ describe('Connection contract', () => {
         await settles(recovered, 30000)
         const replacement: GatewayConnection = await gateway.waitForConnection(2)
         await replacement.waitForFrame(isServiceSubscription, 10000, 'the service subscription on the new connection')
+    })
+
+    it('a reconnect attempt abandoned by disconnect() cannot touch the connection that replaced it', {timeout: 60000}, async () => {
+        // A reconnect is waiting on the caller's connectHeaders() when the caller disconnects and connects
+        // again with different credentials. When the old attempt's function finally answers - here, by
+        // failing - it belongs to a connection that no longer exists and must act on nothing.
+        let calls = 0
+        let failOld: (e: Error) => void = () => undefined
+        const old = connectionInfo({
+            disableStickySession: true,
+            connectHeaders: () => {
+                if (++calls === 1) {
+                    return Promise.resolve({login: 'guest', passcode: 'guest'})
+                }
+                return new Promise((_, reject) => { failOld = reject })
+            }
+        })
+        const fatal: ContinuumError[] = []
+        continuum.eventBus.fatalErrors.subscribe(e => fatal.push(e))
+        await continuum.connect(old)
+        const first = await gateway.waitForConnection(0)
+
+        first.drop()
+        await waitFor(() => calls === 2, 15000)
+        expect(calls, 'the reconnect is waiting on the old credentials').toBe(2)
+
+        await continuum.disconnect()
+        await continuum.connect(connectionInfo())
+        const replacement = await gateway.waitForConnection(1)
+        expect(continuum.eventBus.isConnected()).toBe(true)
+
+        failOld(new Error('token refresh failed (old)'))
+        await sleep(1000)
+        expect(fatal, 'nothing about the abandoned attempt is reported').toEqual([])
+        expect(continuum.eventBus.isConnected(), 'and the replacement is untouched').toBe(true)
+        expect(replacement.frames.filter(f => f.command === 'DISCONNECT'), 'no DISCONNECT went out on it').toEqual([])
+    })
+
+    it('an ERROR frame that arrives during a requested disconnect is not reported as fatal', {timeout: 30000}, async () => {
+        // The gateway can answer a DISCONNECT with an ERROR when something it was still processing for
+        // the connection fails. The caller asked for the close; the reason it ended is that the caller asked.
+        gateway.onDisconnect = 'error'
+        const fatal: ContinuumError[] = []
+        continuum.eventBus.fatalErrors.subscribe(e => fatal.push(e))
+        await continuum.connect(connectionInfo())
+
+        await settles(continuum.disconnect(), 10000)
+        await sleep(500)
+        expect(continuum.eventBus.isConnectionActive()).toBe(false)
+        expect(fatal, 'a close the caller asked for is never fatal, whatever the server said on the way out').toEqual([])
+    })
+
+    it('connected-info survives the escaping the gateway applies to CONNECTED', {timeout: 30000}, async () => {
+        // The gateway's codec doubles backslashes in CONNECTED header values, and STOMP says CONNECTED is
+        // not escaped, so the client is handed JSON it has to undo that on before it is readable.
+        gateway.onConnect = () => ({accept: true, participant: {id: 'DOMAIN\\user', metadata: {name: 'Robert "Bob" Smith'}}})
+        const connectedInfo = await settles(continuum.connect(connectionInfo()), 10000)
+        expect(connectedInfo.participant.id).toBe('DOMAIN\\user')
+        expect((connectedInfo.participant.metadata as any).name).toBe('Robert "Bob" Smith')
+    })
+
+    it('an observe() made while connect() is pending is subscribed once', {timeout: 30000}, async () => {
+        // A subscription made before CONNECTED is made by rx-stomp as the client comes up. It must not be
+        // made a second time when connect() then resolves: the first is torn down and anything already
+        // dispatched to it is lost.
+        const connecting = continuum.connect(connectionInfo())
+        continuum.serviceRegistry.register(new ServiceIdentifier('com.example', 'Early'), {noop: () => undefined})
+        await connecting
+        await sleep(500)
+        const first = await gateway.waitForConnection(0)
+        const ofService = (command: string): number =>
+            first.frames.filter(f => f.command === command && (f.headers['destination'] ?? '').includes('com.example.Early')).length
+        expect(first.frames.filter(f => f.command === 'UNSUBSCRIBE'), 'nothing was unsubscribed').toEqual([])
+        expect(ofService('SUBSCRIBE'), 'subscribed exactly once').toBe(1)
+    })
+
+    it('connect() gives up on a handshake that never completes', {timeout: 30000}, async () => {
+        // A peer that accepts the socket and then says nothing: no CONNECTED, no error, no close.
+        const accepted: Socket[] = []
+        const silent: Server = createServer(socket => { accepted.push(socket) /* and never answer */ })
+        await new Promise<void>(resolve => silent.listen(0, '127.0.0.1', resolve))
+        try {
+            const port = (silent.address() as { port: number }).port
+            const info = connectionInfo({port, maxConnectionAttempts: 1, connectTimeoutMs: 1000})
+            await expect(settles(continuum.connect(info), 10000)).rejects.toThrow(/Max number of reconnection attempts/)
+            expect(continuum.eventBus.isConnectionActive()).toBe(false)
+        } finally {
+            accepted.forEach(socket => socket.destroy())
+            await new Promise<void>(resolve => silent.close(() => resolve()))
+        }
+    })
+
+    it('connected-info that is JSON but not an object is refused, not thrown', {timeout: 30000}, async () => {
+        const uncaught: unknown[] = []
+        const collect = (e: unknown): void => { uncaught.push(e) }
+        process.on('uncaughtException', collect)
+        process.on('unhandledRejection', collect)
+        try {
+            gateway.onConnect = () => ({connectedHeaders: {version: '1.2', 'heart-beat': '0,0', 'connected-info': 'null'}})
+            await expect(settles(continuum.connect(connectionInfo()), 10000)).rejects.toThrow(/proper data/)
+            expect(continuum.eventBus.isConnectionActive()).toBe(false)
+            await sleep(500)
+            expect(uncaught, 'nothing escapes to the process').toEqual([])
+        } finally {
+            process.off('uncaughtException', collect)
+            process.off('unhandledRejection', collect)
+        }
+    })
+
+    it('a polite close the peer never acknowledges is bounded', {timeout: 30000}, async () => {
+        // A CONNECTED frame the client cannot use is answered with a DISCONNECT, out of courtesy to a
+        // server holding a session. Courtesy has a limit: a peer that never sends the RECEIPT does not
+        // get to keep connect() pending.
+        gateway.onDisconnect = 'ignore'
+        gateway.onConnect = () => ({connectedHeaders: {version: '1.2', 'heart-beat': '0,0'}})
+        await expect(settles(continuum.connect(connectionInfo()), 15000)).rejects.toThrow(/proper data/)
+        expect(continuum.eventBus.isConnectionActive()).toBe(false)
+    })
+
+    it('a service registered before connect() is served once connected', {timeout: 30000}, async () => {
+        // Services are registered at construction, by decorator; whether the connection is up yet is not
+        // theirs to know. The subscription is made when there is a connection to make it on.
+        continuum.serviceRegistry.register(new ServiceIdentifier('com.example', 'Eager'), {noop: () => undefined})
+        await continuum.connect(connectionInfo())
+        const first = await gateway.waitForConnection(0)
+        await first.waitForFrame(f => f.command === 'SUBSCRIBE' && (f.headers['destination'] ?? '').includes('com.example.Eager'),
+                                 5000, 'the service subscription')
+    })
+
+    it('an unusable host rejects connect() rather than hanging it', {timeout: 30000}, async () => {
+        const info = connectionInfo({host: 'localhost:8080'})
+        await expect(settles(continuum.connect(info), 5000)).rejects.toBeInstanceOf(ContinuumError)
+        expect(continuum.eventBus.isConnectionActive()).toBe(false)
+    })
+
+    it('one observe() result subscribed twice is one subscription on the wire', {timeout: 30000}, async () => {
+        await continuum.connect(connectionInfo())
+        const events = continuum.eventBus.observe('srv://com.example.Shared')
+        const a = events.subscribe()
+        const b = events.subscribe()
+        await sleep(500)
+        const first = await gateway.waitForConnection(0)
+        expect(first.frames.filter(f => f.command === 'SUBSCRIBE' && f.headers['destination'] === 'srv://com.example.Shared').length).toBe(1)
+        a.unsubscribe()
+        b.unsubscribe()
     })
 })
 
