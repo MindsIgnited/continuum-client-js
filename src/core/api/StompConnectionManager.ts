@@ -4,7 +4,7 @@ import {ContinuumError} from '@/api/errors/ContinuumError'
 import {ConnectedInfo} from '@/api/security/ConnectedInfo'
 import {EventConstants} from '@/core/api/IEventBus'
 import {IFrame, IMessage, IRxStompPublishParams, RxStomp, RxStompConfig, RxStompState, StompHeaders} from '@stomp/rx-stomp'
-import {IStompSocket, ReconnectionTimeMode} from '@stomp/stompjs'
+import {IStompSocket, ReconnectionTimeMode, TickerStrategy} from '@stomp/stompjs'
 import {Observable, Subject} from 'rxjs'
 import {v4 as uuidv4} from 'uuid'
 import debug from 'debug'
@@ -136,6 +136,15 @@ export class StompConnectionManager {
             const abandoned = (): boolean => this.rxStomp !== rxStomp
 
             const connectTimeoutMs = connectionInfo.connectTimeoutMs
+            const effectiveConnectTimeoutMs = connectTimeoutMs != null && connectTimeoutMs > 0 ? connectTimeoutMs : this.DEFAULT_CONNECT_TIMEOUT_MS
+            const withinConnectTimeout = <T>(work: Promise<T>): Promise<T> => {
+                let timer: ReturnType<typeof setTimeout> | undefined
+                const expired = new Promise<never>((_, reject) => {
+                    timer = setTimeout(() => reject(new Error(`connectHeaders did not settle within ${effectiveConnectTimeoutMs}ms`)),
+                                       effectiveConnectTimeoutMs)
+                })
+                return Promise.race([work, expired]).finally(() => clearTimeout(timer))
+            }
             const stompConfig: RxStompConfig = {
                 // The constructor throws on a URL that parses but a WebSocket will not open, or when there
                 // is no WebSocket at all, and it does so inside a stompjs call nothing awaits - so caught
@@ -155,10 +164,14 @@ export class StompConnectionManager {
                 // A peer that accepts the socket and then says nothing would otherwise hold the attempt
                 // open forever; past this stompjs abandons it and it counts as a failed attempt. Zero
                 // would switch the watcher off, which no caller means by it.
-                connectionTimeout: connectTimeoutMs != null && connectTimeoutMs > 0 ? connectTimeoutMs : this.DEFAULT_CONNECT_TIMEOUT_MS,
+                connectionTimeout: effectiveConnectTimeoutMs,
                 // Abandoning means discarding the socket. Closing it politely waits on the peer that
                 // stalled, for as long as the socket library cares to wait, and charges that to the attempt.
                 discardWebsocketOnCommFailure: true,
+                // Outgoing heartbeats from a worker where there is one: a browser throttles a hidden
+                // tab's timers until the gateway, hearing nothing, closes the socket. Falls back to a
+                // plain interval where there is no Worker, as in Node.
+                heartbeatStrategy: TickerStrategy.Worker,
                 beforeConnect: async (): Promise<void> => {
                     if (abandoned()) {
                         return
@@ -185,7 +198,9 @@ export class StompConnectionManager {
                     // what escapes from here, and a rejection would leave everything hanging, still active.
                     let headers: StompHeaders
                     try {
-                        headers = await this.connectHeadersForAttempt(connectionInfo)
+                        // The caller's function is part of the attempt, so the attempt's bound covers
+                        // it: a token endpoint that never answers is a stalled attempt like any other
+                        headers = await withinConnectTimeout(this.connectHeadersForAttempt(connectionInfo))
                     } catch (e: any) {
                         if (!abandoned()) {
                             await this.close(new ContinuumError(`connectHeaders could not be produced: ${e?.message ?? e}`))
@@ -432,7 +447,14 @@ export class StompConnectionManager {
         const supplied = typeof connectionInfo.connectHeaders === 'function'
             ? await connectionInfo.connectHeaders()
             : connectionInfo.connectHeaders
-        const headers: StompHeaders = {...supplied}
+        // STOMP says CONNECT values are not escaped, and stompjs sends them as they are. The gateway's
+        // parser (vertx-stomp-lite HeaderCodec.decode) decodes them all the same, and drops the frame
+        // on an escape it does not know - so a backslash, as in a Windows domain login, is doubled here
+        // to arrive as sent. The counterpart to the CONNECTED handling in parseConnectedInfo.
+        const headers: StompHeaders = {}
+        for (const [key, value] of Object.entries(supplied ?? {})) {
+            headers[key] = String(value).replace(/\\/g, '\\\\')
+        }
 
         if (connectionInfo.disableStickySession) {
             headers[EventConstants.DISABLE_STICKY_SESSION_HEADER] = 'true'

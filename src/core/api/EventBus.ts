@@ -121,8 +121,11 @@ export class EventBus implements IEventBus {
                 this.failPendingRequests(new ConnectionLostError(
                     'Connection to the server was lost while this request was in flight; it will not receive a reply'))
             } else {
+                // The error the connection closed with travels as the cause: one of these requests may
+                // be the reason the server closed it, and a caller deciding whether to retry needs that
                 this.failPendingRequests(new ConnectionLostError(
-                    event.error ? `Connection closed: ${event.error.message}` : 'Connection disconnected'))
+                    event.error ? `Connection closed: ${event.error.message}` : 'Connection disconnected',
+                    event.error))
                 this.serverInfo = null
                 this.closeError = event.error ?? null
                 if (event.error && this.established) {

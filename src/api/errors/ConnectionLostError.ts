@@ -26,14 +26,21 @@ import {ContinuumError} from './ContinuumError'
  * purpose is not part of it, though the message says which.
  *
  * It is distinct from an application error returned by the server so that a caller can tell "the
- * server told me no" from "the server never got to answer", and retry the latter when the operation
- * is idempotent.
+ * server told me no" from "the server never got to answer". Before retrying, look at {@link cause}:
+ * when the server closed the connection with an ERROR, that error is here, and one of the requests
+ * failed by the close may be what it refused - the gateway ends the whole connection over a single
+ * SEND it will not accept, so retrying that one ends the next connection too. A cause of undefined
+ * means the socket dropped or the caller disconnected; retry then if the operation is idempotent.
  */
 export class ConnectionLostError extends ContinuumError {
 
-    constructor(message: string) {
+    /** The error the connection closed with, when the server closed it; undefined for a socket loss or a requested disconnect */
+    public readonly cause: ContinuumError | undefined
+
+    constructor(message: string, cause?: ContinuumError) {
         super(message);
         Object.setPrototypeOf(this, ConnectionLostError.prototype);
         this.name = 'ConnectionLostError'
+        this.cause = cause
     }
 }

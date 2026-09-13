@@ -201,10 +201,18 @@ export class ServiceInvocationSupervisor {
         try {
             result = handlerMethod(...args)
             if (result instanceof Promise) {
+                // Nothing awaits this chain, so nothing may escape it: a reply that cannot be produced
+                // is itself answered with an error, and if even that fails it is logged
                 result.then(
                     (resolved) => this.processMethodInvocationResult(event, resolved),
                     (error) => this.handleException(event, error)
-                )
+                ).catch((e) => {
+                    try {
+                        this.handleException(event, e)
+                    } catch (again) {
+                        this.log.error(`Could not answer ${event.cri} at all`, again)
+                    }
+                })
             } else {
                 this.processMethodInvocationResult(event, result)
             }
@@ -219,13 +227,15 @@ export class ServiceInvocationSupervisor {
     }
 
     private handleException(event: IEvent, error: any): void {
+        // A promise may reject with nothing at all
+        const message = error?.message || "Unknown error"
         const errorEvent = EventUtil.createReplyEvent(
             event.headers,
             new Map([
-                        [EventConstants.ERROR_HEADER, error.message || "Unknown error"],
+                        [EventConstants.ERROR_HEADER, message],
                         [EventConstants.CONTENT_TYPE_HEADER, "application/json"]
                     ]),
-            new TextEncoder().encode(JSON.stringify({ message: error.message }))
+            new TextEncoder().encode(JSON.stringify({ message }))
         )
         this.reply(event, errorEvent)
     }

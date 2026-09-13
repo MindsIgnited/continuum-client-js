@@ -98,11 +98,21 @@ export interface IEventBus {
 
     /**
      * Emits when the connection was closed by something other than {@link IEventBus#disconnect}, after a
-     * successful {@link IEventBus#connect}: the server refused a reconnect ({@link ConnectionRefusedError}),
-     * or {@link ConnectionInfo#maxConnectionAttempts} was reached. By then the connection is already down
-     * and every pending request has been failed; connect() again, with whatever credentials are right now,
-     * if the connection is wanted back. That may be done from inside the subscription.
-     * A refusal before connect() resolves rejects that promise instead of emitting here.
+     * successful {@link IEventBus#connect}. By then the connection is already down and every pending
+     * request has been failed; connect() again, with whatever credentials are right now, if the
+     * connection is wanted back. That may be done from inside the subscription.
+     *
+     * The error says why:
+     * - {@link ConnectionRefusedError}: the server ended the connection with an ERROR frame. A reconnect
+     *   presenting a session it no longer has, or a frame it would not accept - the gateway ends the whole
+     *   connection over one SEND or SUBSCRIBE it refuses, including a subscription made again on connect()
+     *   that the new credentials are not allowed. A handler that connects again unconditionally will do
+     *   so repeatedly in that case; look at the message before deciding.
+     * - {@link ContinuumError}: the connection could not be kept up. {@link ConnectionInfo#maxConnectionAttempts}
+     *   was reached, a {@link ConnectionInfo#connectHeaders} function failed or timed out on a reconnect,
+     *   or the server's CONNECTED frame could not be used.
+     *
+     * A failure before connect() resolves rejects that promise instead of emitting here.
      */
     fatalErrors: Observable<ContinuumError>
 
@@ -119,8 +129,10 @@ export interface IEventBus {
     connect(connectionInfo: ConnectionInfo): Promise<ConnectedInfo>
 
     /**
-     * Disconnects the client from the server
-     * This will clear any subscriptions and close the connection
+     * Disconnects the client from the server and closes the connection.
+     * Pending requests are failed with {@link ConnectionLostError}. Subscriptions made with
+     * {@link IEventBus#observe} are detached but not ended: they are made again on the next connect(),
+     * whoever it connects as - unsubscribe what the next connection should not carry.
      * @param force if true then the connection will be closed immediately without sending a disconnect frame
      *        When this mode is used, the actual Websocket may linger for a while
      *        and the broker may not realize that the connection is no longer in use.

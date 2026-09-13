@@ -57,9 +57,11 @@ export class ConnectionInfo extends ServerInfo {
     maxConnectionAttempts?: number | null
 
     /**
-     * How long a single connection attempt may take to reach a CONNECTED frame before it is abandoned
-     * and counted as a failed attempt. This bounds a peer that accepts the socket but never completes the
-     * handshake. Default 10 seconds; set higher for slow networks.
+     * How long a single connection attempt may take before it is abandoned and counted as a failed
+     * attempt: the {@link connectHeaders} function, if there is one, and then the socket and STOMP
+     * handshake up to the CONNECTED frame, each bounded by this. It covers a token endpoint that never
+     * answers as well as a peer that accepts the socket and then says nothing.
+     * Default 10 seconds; set higher for slow networks. Zero or less means the default, not no bound.
      */
     connectTimeoutMs?: number | null
 
