@@ -291,16 +291,33 @@ function parseFrames(data: RawData): Frame[] {
     }
     const [commandLine, ...headerLines] = head.split('\n')
     const command = commandLine.replace(/\r$/, '')
-    // STOMP 1.2 escapes header values everywhere except the CONNECT and CONNECTED frames
-    const unescape = command === 'CONNECT' || command === 'STOMP' ? (v: string) => v : unescapeHeaderValue
+    // STOMP 1.2 escapes header values everywhere except the CONNECT and CONNECTED frames. The gateway's
+    // parser (vertx-stomp-lite FrameParser -> HeaderCodec.decode) nonetheless decodes CONNECT values, and
+    // a backslash before anything but \\ r n c is a FrameException it does not route anywhere: the
+    // frame is dropped, the socket left open, and the client hears nothing.
+    const unescape = command === 'CONNECT' || command === 'STOMP' ? decodeConnectLikeTheGateway : unescapeHeaderValue
     const headers: Record<string, string> = {}
-    for (const line of headerLines) {
-        const colon = line.indexOf(':')
-        if (colon > 0 && !(line.substring(0, colon) in headers)) {
-            headers[line.substring(0, colon)] = unescape(line.substring(colon + 1).replace(/\r$/, ''))
+    try {
+        for (const line of headerLines) {
+            const colon = line.indexOf(':')
+            if (colon > 0 && !(line.substring(0, colon) in headers)) {
+                headers[line.substring(0, colon)] = unescape(line.substring(colon + 1).replace(/\r$/, ''))
+            }
         }
+    } catch (e) {
+        return []
     }
     return [{command, headers, body}]
+}
+
+function decodeConnectLikeTheGateway(value: string): string {
+    return value.replace(/\\(.)/g, (_, c: string) => {
+        const decoded = ({r: '\r', n: '\n', c: ':', '\\': '\\'} as Record<string, string>)[c]
+        if (decoded == null) {
+            throw new Error(`the gateway drops a CONNECT with the escape \\${c} in a header value`)
+        }
+        return decoded
+    })
 }
 
 function escapeConnectedLikeTheGateway(value: string): string {

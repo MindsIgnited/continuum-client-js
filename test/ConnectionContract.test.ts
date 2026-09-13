@@ -505,6 +505,78 @@ describe('Connection contract', () => {
         await expect(settles(continuum.connect(connectionInfo({disableStickySession: true})), 10000)).rejects.toThrow(/proper data/)
     })
 
+    it('a hosted service that cannot produce its reply answers with an error, not by ending the process', {timeout: 30000}, async () => {
+        // The call succeeded; converting what it returned did not. Or it failed with no value at all.
+        // Either way the reply is made from inside a promise handler nothing awaits.
+        const uncaught: unknown[] = []
+        const collect = (e: unknown): void => { uncaught.push(e) }
+        process.on('uncaughtException', collect)
+        process.on('unhandledRejection', collect)
+        try {
+            class AwkwardService {
+                async circular(): Promise<unknown> {
+                    const a: any = {}
+                    a.self = a
+                    return a
+                }
+                async valueless(): Promise<unknown> {
+                    return Promise.reject()
+                }
+            }
+            continuum.serviceRegistry.register(new ServiceIdentifier('com.example', 'Awkward'), new AwkwardService())
+            const replies: { command: string, headers: Record<string, string> }[] = []
+            const replyTo = 'srv://caller@continuum.js.EventBus/replyHandler'
+            gateway.handlers.set(replyTo, frame => { replies.push(frame) })
+            await continuum.connect(connectionInfo())
+            const first = await gateway.waitForConnection(0)
+            const subscription = await first.waitForFrame(f => f.command === 'SUBSCRIBE' && (f.headers['destination'] ?? '').includes('com.example.Awkward'),
+                                                          5000, 'the service subscription')
+            for (const [method, correlation] of [['circular', 'c1'], ['valueless', 'c2']]) {
+                first.sendMessage(subscription.headers['destination'] + '/' + method,
+                                  {'reply-to': replyTo, '__correlation-id': correlation, 'content-type': 'application/json'},
+                                  '[]', subscription.headers['destination'])
+            }
+            await waitFor(() => replies.length === 2, 5000)
+            expect(replies.map(r => r.headers['__correlation-id']).sort(), 'each call is answered').toEqual(['c1', 'c2'])
+            for (const reply of replies) {
+                expect(reply.headers['error'], 'with an error').toBeDefined()
+            }
+            expect(uncaught, 'nothing escapes to the process').toEqual([])
+        } finally {
+            process.off('uncaughtException', collect)
+            process.off('unhandledRejection', collect)
+        }
+    })
+
+    it('a backslash in a credential reaches the gateway as sent', {timeout: 30000}, async () => {
+        // The gateway decodes CONNECT header values as if they were escaped, though STOMP says they are
+        // not, so a value with a backslash in it - a Windows domain login - has to be sent escaped or it
+        // is dropped on the floor and the connect times out, over and over, with no word why.
+        const info = connectionInfo({connectHeaders: {login: 'DOMAIN\\user', passcode: 'x'}, connectTimeoutMs: 1000, maxConnectionAttempts: 1})
+        await settles(continuum.connect(info), 10000)
+        const first = await gateway.waitForConnection(0)
+        expect(first.frames[0].headers['login']).toBe('DOMAIN\\user')
+    })
+
+    it('connectTimeoutMs bounds the caller\'s connectHeaders() too', {timeout: 30000}, async () => {
+        // Fetching a token is part of the attempt; a token endpoint that never answers is a stalled
+        // attempt like any other, not a hang the bound does not see.
+        const info = connectionInfo({connectHeaders: () => new Promise(() => { /* never */ }), connectTimeoutMs: 1000, maxConnectionAttempts: 1})
+        await expect(settles(continuum.connect(info), 6000)).rejects.toThrow(/connectHeaders/)
+        expect(continuum.eventBus.isConnectionActive()).toBe(false)
+    })
+
+    it('exhausting maxConnectionAttempts after a working connection is reported on fatalErrors', {timeout: 30000}, async () => {
+        const fatal: ContinuumError[] = []
+        continuum.eventBus.fatalErrors.subscribe(e => fatal.push(e))
+        await continuum.connect(connectionInfo({maxConnectionAttempts: 1}))
+        await gateway.stop()
+        await waitFor(() => fatal.length > 0, 20000)
+        expect(fatal.length, 'reported exactly once').toBe(1)
+        expect(fatal[0].message).toMatch(/Max number of reconnection attempts/)
+        expect(continuum.eventBus.isConnectionActive(), 'with the connection already down').toBe(false)
+    })
+
     it('one observe() result subscribed twice is one subscription on the wire', {timeout: 30000}, async () => {
         await continuum.connect(connectionInfo())
         const events = continuum.eventBus.observe('srv://com.example.Shared')
