@@ -34,5 +34,6 @@ export class ConnectionLostError extends ContinuumError {
     constructor(message: string) {
         super(message);
         Object.setPrototypeOf(this, ConnectionLostError.prototype);
+        this.name = 'ConnectionLostError'
     }
 }

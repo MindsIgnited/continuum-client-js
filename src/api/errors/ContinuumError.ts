@@ -23,5 +23,6 @@ export class ContinuumError extends Error {
     constructor(message: string) {
         super(message);
         Object.setPrototypeOf(this, ContinuumError.prototype);
+        this.name = 'ContinuumError'
     }
 }

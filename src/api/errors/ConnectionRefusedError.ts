@@ -37,6 +37,7 @@ export class ConnectionRefusedError extends ContinuumError {
     constructor(frame: IFrame) {
         super(frame.headers['message'] ?? 'Connection refused by server');
         Object.setPrototypeOf(this, ConnectionRefusedError.prototype);
+        this.name = 'ConnectionRefusedError'
         this.headers = {...frame.headers}
         this.body = frame.body
     }

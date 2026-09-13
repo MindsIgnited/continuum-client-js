@@ -106,6 +106,8 @@ export class EventBus implements IEventBus {
     private requestRepliesSubject: Subject<IEvent> | null = null
     private requestRepliesSubscription: Subscription | null = null
     private fatalErrorSubject: Subject<ContinuumError> = new Subject<ContinuumError>()
+    /** Emits after each successful connect(), so what observes a destination can follow the connection */
+    private readonly activated: Subject<void> = new Subject<void>()
     /** True from connect() resolving until the connection closes: what decides whether a loss is reported here or by connect() */
     private established: boolean = false
     /** Why the connection closed, if it closed on its own, so a send() into the dead connection can say so */
@@ -155,6 +157,7 @@ export class EventBus implements IEventBus {
 
         // FIXME: a reply should not need a reply, therefore a replyCri probably should not be a EventConstants.SERVICE_DESTINATION_PREFIX
         this.replyToCri = this.stompConnectionManager.replyToCri
+        this.activated.next()
 
         return connectedInfo
     }
@@ -208,8 +211,9 @@ export class EventBus implements IEventBus {
                 this.requestRepliesSubscription = this.requestRepliesObservable.connect()
             }
 
-            // Set once the request can no longer be cancelled: the server finished it, or the
-            // connection failed it. Either way there is no one to send a cancel to.
+            // Set once the server has finished the request, so there is nothing left to cancel. A request
+            // the connection failed is not finished: with a sticky session the server is still running
+            // it, so the cancel is still owed and goes out on the connection that replaces the lost one.
             let finished = false
             const correlationId = uuidv4()
             const defaultMessagesSubscription: Unsubscribable
@@ -241,7 +245,6 @@ export class EventBus implements IEventBus {
                                                   }
                                               },
                                               error(err: any): void {
-                                                  finished = true
                                                   subscriber.error(err)
                                               },
                                               complete(): void {
@@ -309,6 +312,11 @@ export class EventBus implements IEventBus {
     /**
      * This is internal impl of observe that creates a cold observable.
      * The public variants transform this to some type of hot observable depending on the need
+     *
+     * The subscription follows the connection: it is made on the connection that is active now and
+     * again on each one that replaces it after a close, so a registered service is served on whatever
+     * connection the caller establishes next. Within one connection rx-stomp re-subscribes on reconnect
+     * by itself; across connections that is done here.
      * @param cri to observe
      * @return the cold {@link Observable<IEvent>} for the given destination
      */
@@ -316,23 +324,49 @@ export class EventBus implements IEventBus {
         if(!this.stompConnectionManager.active) {
             throw this.createSendUnavailableError()
         }
-        return this.stompConnectionManager
-                   .watch(cri)
-                   .pipe(map<IMessage, IEvent>((message: IMessage): IEvent => {
+        return new Observable<IEvent>((subscriber) => {
+            let current: Subscription | null = null
+            const attach = (): void => {
+                current?.unsubscribe()
+                // Forwarded through a plain observer: handed the subscriber itself, RxJS would use it as
+                // the inner subscription, and detaching from a closed connection would end the caller's too
+                current = this.stompConnectionManager
+                              .watch(cri)
+                              .pipe(map<IMessage, IEvent>(EventBus.toEvent))
+                              .subscribe({
+                                             next: (event: IEvent) => subscriber.next(event),
+                                             error: (error: any) => subscriber.error(error),
+                                             complete: () => subscriber.complete()
+                                         })
+            }
+            attach()
+            const following = new Subscription()
+            following.add(this.stompConnectionManager.events.subscribe(event => {
+                if (event.type === 'closed') {
+                    current?.unsubscribe()
+                    current = null
+                }
+            }))
+            following.add(this.activated.subscribe(() => attach()))
+            return () => {
+                following.unsubscribe()
+                current?.unsubscribe()
+            }
+        })
+    }
 
-                       // We translate all IMessage objects to IEvent objects
-                       const headers: Map<string, string> = new Map<string, string>()
-                       let destination: string = ''
-                       for (const prop of Object.keys(message.headers)) {
-                           if (prop === 'destination') {
-                               destination = message.headers[prop]
-                           }else{
-                               headers.set(prop, message.headers[prop])
-                           }
-                       }
-
-                       return new Event(destination, headers, message.binaryBody)
-                   }))
+    /** We translate all IMessage objects to IEvent objects */
+    private static toEvent(message: IMessage): IEvent {
+        const headers: Map<string, string> = new Map<string, string>()
+        let destination: string = ''
+        for (const prop of Object.keys(message.headers)) {
+            if (prop === 'destination') {
+                destination = message.headers[prop]
+            }else{
+                headers.set(prop, message.headers[prop])
+            }
+        }
+        return new Event(destination, headers, message.binaryBody)
     }
 
 }

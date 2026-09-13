@@ -152,7 +152,9 @@ export interface IEventBus {
     listen(serverInfo: ServerInfo): Promise<void>
 
     /**
-     * Creates a subscription for all {@link IEvent}'s for the given destination
+     * Creates a subscription for all {@link IEvent}'s for the given destination.
+     * The subscription follows the connection: if the connection is closed and connect() is called
+     * again, it is made again on the new connection, so what was listening goes on listening.
      * @param cri to subscribe to
      */
     observe(cri: string): Observable<IEvent>

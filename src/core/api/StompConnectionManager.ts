@@ -44,6 +44,8 @@ export class StompConnectionManager {
     private rxStomp: RxStomp | null = null
     /** The teardown in progress, so a deactivate() that overlaps another waits on it rather than repeating it */
     private closing: Promise<void> | null = null
+    /** Why the teardown in progress is happening, if it has a reason; an overlapping close may supply one */
+    private closingError: ContinuumError | undefined = undefined
     /** Rejects the activate() promise, until the first CONNECTED frame settles it */
     private rejectActivation: ((error: ContinuumError) => void) | null = null
 
@@ -132,8 +134,14 @@ export class StompConnectionManager {
                     }
                     await this.connectionJitterDelay()
                     // Headers are built fresh for every attempt, so nothing is ever mutated: not the
-                    // caller's object, and not what an earlier attempt sent
-                    rxStomp.stompClient.connectHeaders = await this.connectHeadersForAttempt(connectionInfo)
+                    // caller's object, and not what an earlier attempt sent. A caller's function that
+                    // cannot answer ends the connection rather than the attempt: stompjs does not catch
+                    // what escapes from here, and a rejection would leave everything hanging, still active.
+                    try {
+                        rxStomp.stompClient.connectHeaders = await this.connectHeadersForAttempt(connectionInfo)
+                    } catch (e: any) {
+                        await this.close(new ContinuumError(`connectHeaders could not be produced: ${e?.message ?? e}`))
+                    }
                 }
             }
 
@@ -159,8 +167,7 @@ export class StompConnectionManager {
             // leaves connecting again to the caller. The socket is discarded rather than closed politely;
             // there is nothing left to say, and waiting on the server's close would only delay the report.
             rxStomp.stompErrors$.subscribe((frame: IFrame) => {
-                this.close(new ConnectionRefusedError(frame), true)
-                    .catch(e => this.debugLogger(`Error closing after ERROR frame: ${e}`))
+                this.closeAfterCallback(new ConnectionRefusedError(frame), true)
             })
 
             // The socket of an established connection closing means whatever was in flight is gone.
@@ -179,22 +186,27 @@ export class StompConnectionManager {
 
             // This is triggered when the server sends a CONNECTED frame.
             rxStomp.serverHeaders$.subscribe((headers: StompHeaders) => {
-                const connectedInfoJson: string | undefined = headers[EventConstants.CONNECTED_INFO_HEADER]
-                if (connectedInfoJson == null) {
-                    this.close(new ContinuumError('Server did not return proper data for successful login'), true)
-                        .catch(e => this.debugLogger(`Error closing after bad CONNECTED frame: ${e}`))
+                // The credentials that opened this connection have done their work. They are cleared in
+                // place because stompjs keeps its own reference to this object; the next attempt is built afresh.
+                const sent = rxStomp.stompClient.connectHeaders
+                for (const key of Object.keys(sent)) {
+                    delete sent[key]
+                }
+
+                const connectedInfo = this.parseConnectedInfo(headers, connectionInfo)
+                if (connectedInfo == null) {
+                    // The server has accepted us and holds a session, so it is told rather than cut off,
+                    // which means the socket is not discarded from inside the callback that delivered CONNECTED
+                    this.closeAfterCallback(new ContinuumError('Server did not return proper data for successful login'), false)
                     return
                 }
-                const connectedInfo: ConnectedInfo = JSON.parse(connectedInfoJson)
 
                 if (!connectionInfo.disableStickySession) {
-                    if (connectedInfo.sessionId == null || connectedInfo.replyToId == null) {
-                        this.close(new ContinuumError('Server did not return proper data for successful login'), true)
-                            .catch(e => this.debugLogger(`Error closing after bad CONNECTED frame: ${e}`))
-                        return
-                    }
                     this.sessionId = connectedInfo.sessionId
                 }
+                // Each reconnect gets the full bound of attempts; a connection that recovers has not spent any
+                this.connectionAttempts = 0
+                this.lastWebsocketError = null
 
                 if (!this.everConnected) {
                     this.everConnected = true
@@ -233,27 +245,70 @@ export class StompConnectionManager {
         if (this.state === 'inactive') {
             return Promise.resolve()
         }
+        const rxStomp = this.rxStomp!
         if (this.closing) {
+            // A close that overlaps one in progress adds what it knows. A reason, if the first had none:
+            // an ERROR frame arriving during a polite close is still the reason it ended. And force, which
+            // stompjs honours while already deactivating - a polite close waiting on a peer that will
+            // never answer is exactly what a forced one is for.
+            this.closingError ??= error
+            if (force) {
+                rxStomp.deactivate({force: true})
+                       .catch(e => this.debugLogger(`Error forcing a close already in progress: ${e}`))
+            }
             return this.closing
         }
         this.state = 'closing'
-        const rxStomp = this.rxStomp!
+        this.closingError = error
         this.closing = (async (): Promise<void> => {
             try {
                 await rxStomp.deactivate({force: force})
             } finally {
                 const rejectActivation = this.rejectActivation
+                const closedWith = this.closingError
                 this.rejectActivation = null
+                this.closingError = undefined
                 this.rxStomp = null
                 this.closing = null
                 this.state = 'inactive'
-                this.eventSubject.next({type: 'closed', error: error})
+                this.eventSubject.next({type: 'closed', error: closedWith})
                 if (rejectActivation) {
-                    rejectActivation(error ?? new ContinuumError('Connection was closed before it was established'))
+                    rejectActivation(closedWith ?? new ContinuumError('Connection was closed before it was established'))
                 }
             }
         })()
         return this.closing
+    }
+
+    /**
+     * A close asked for from inside one of rx-stomp's own callbacks. It is deferred a tick so the
+     * callback's caller finishes first: a browser WebSocket has no terminate(), and the one stompjs
+     * installs runs the close handlers synchronously, which from inside onConnect would tear the
+     * client down before rx-stomp had finished bringing it up.
+     */
+    private closeAfterCallback(error: ContinuumError, force: boolean): void {
+        queueMicrotask(() => {
+            this.close(error, force).catch(e => this.debugLogger(`Error closing after ${error.message}: ${e}`))
+        })
+    }
+
+    /** The connected info the server sent, or null if it sent none or something unreadable */
+    private parseConnectedInfo(headers: StompHeaders, connectionInfo: ConnectionInfo): ConnectedInfo | null {
+        const connectedInfoJson: string | undefined = headers[EventConstants.CONNECTED_INFO_HEADER]
+        if (connectedInfoJson == null) {
+            return null
+        }
+        let connectedInfo: ConnectedInfo
+        try {
+            connectedInfo = JSON.parse(connectedInfoJson)
+        } catch (e) {
+            this.debugLogger(`Unreadable ${EventConstants.CONNECTED_INFO_HEADER} header: ${e}`)
+            return null
+        }
+        if (!connectionInfo.disableStickySession && (connectedInfo.sessionId == null || connectedInfo.replyToId == null)) {
+            return null
+        }
+        return connectedInfo
     }
 
     /**
