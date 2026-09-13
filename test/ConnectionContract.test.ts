@@ -577,6 +577,17 @@ describe('Connection contract', () => {
         expect(continuum.eventBus.isConnectionActive(), 'with the connection already down').toBe(false)
     })
 
+    it('a refusal\'s message reads as the server wrote it, even before CONNECTED', {timeout: 30000}, async () => {
+        // STOMP escapes header values in every frame but CONNECT and CONNECTED, and stompjs undoes that
+        // only once CONNECTED has arrived. A refusal is an ERROR that arrives instead of CONNECTED, so
+        // its message would otherwise carry the gateway's escapes: a colon as \\c.
+        gateway.onConnect = () => ({refuse: 'org.example.AuthenticationException: Could not authenticate with the given Session id'})
+        await expect(settles(continuum.connect(connectionInfo()), 10000)).rejects.toMatchObject({
+            name: 'ConnectionRefusedError',
+            message: 'org.example.AuthenticationException: Could not authenticate with the given Session id'
+        })
+    })
+
     it('one observe() result subscribed twice is one subscription on the wire', {timeout: 30000}, async () => {
         await continuum.connect(connectionInfo())
         const events = continuum.eventBus.observe('srv://com.example.Shared')

@@ -243,15 +243,23 @@ export class StompConnectionManager {
             // leaves connecting again to the caller. The socket is discarded rather than closed politely;
             // there is nothing left to say, and waiting on the server's close would only delay the report.
             rxStomp.stompErrors$.subscribe((frame: IFrame) => {
-                this.closeAfterCallback(new ConnectionRefusedError(frame), true)
+                // STOMP escapes header values in every frame but CONNECT and CONNECTED, and stompjs
+                // undoes that only once CONNECTED has arrived on the socket. A refusal is an ERROR
+                // that arrives instead of CONNECTED, so its headers still carry the escapes.
+                this.closeAfterCallback(new ConnectionRefusedError(openOnThisSocket ? frame : unescapeHeaders(frame)), true)
             })
 
             // The socket of an established connection closing means whatever was in flight is gone.
             // Only reported when the close was not ours: a deactivate() ends in a `closed` event instead.
             let wasOpen = false
+            // Whether CONNECTED has arrived on the socket currently in use; each reconnect starts over
+            let openOnThisSocket = false
             rxStomp.connectionState$.subscribe((state: RxStompState) => {
                 if (state === RxStompState.OPEN) {
                     wasOpen = true
+                    openOnThisSocket = true
+                } else if (state === RxStompState.CONNECTING) {
+                    openOnThisSocket = false
                 } else if (wasOpen && (state === RxStompState.CLOSING || state === RxStompState.CLOSED)) {
                     wasOpen = false
                     if (this.state === 'active') {
@@ -480,6 +488,15 @@ export class StompConnectionManager {
         }
     }
 
+}
+
+/** The frame with its header values unescaped as STOMP 1.2 has them escaped: \\c, \\n, \\r and \\\\ */
+function unescapeHeaders(frame: IFrame): IFrame {
+    const headers: StompHeaders = {}
+    for (const [key, value] of Object.entries(frame.headers)) {
+        headers[key] = value.replace(/\\(.)/g, (whole, c: string) => ({c: ':', n: '\n', r: '\r', '\\': '\\'} as Record<string, string>)[c] ?? whole)
+    }
+    return {...frame, headers}
 }
 
 /** A socket that was never open, for stompjs to find nothing to wait for on */
