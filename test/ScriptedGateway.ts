@@ -26,6 +26,8 @@ export type ConnectDecision =
     | { refuse: string }
     /** A CONNECTED with exactly these headers and nothing added, for the malformed cases */
     | { connectedHeaders: Record<string, string> }
+    /** The socket is accepted and then nothing is read or written on it, ever: a gateway that has stalled */
+    | { silent: true }
 
 export class GatewayConnection {
 
@@ -71,11 +73,15 @@ export class GatewayConnection {
         this.socket.send(`${command}\n${headerLines}\n\n${body}\0`)
     }
 
-    /** A MESSAGE to a destination the client has subscribed to */
-    public sendMessage(destination: string, headers: Record<string, string>, body: string = ''): void {
-        const subscription = [...this.subscriptions.entries()].find(([, d]) => d === destination)?.[0]
+    /**
+     * A MESSAGE to a destination the client has subscribed to. A service is subscribed by its base
+     * resource and invoked by a method path under it, so `subscribedAs` names the subscription when
+     * it differs from the destination. Nothing subscribed means nothing is sent, as the gateway does.
+     */
+    public sendMessage(destination: string, headers: Record<string, string>, body: string = '', subscribedAs: string = destination): void {
+        const subscription = [...this.subscriptions.entries()].find(([, d]) => d === subscribedAs)?.[0]
         if (subscription == null) {
-            throw new Error(`client has no subscription to ${destination}`)
+            return
         }
         this.send('MESSAGE', {destination, subscription, 'message-id': uuidv4(), ...headers}, body)
     }
@@ -207,7 +213,11 @@ export class ScriptedGateway {
             case 'CONNECT':
             case 'STOMP': {
                 const decision = this.onConnect(frame.headers, connection)
-                if ('refuse' in decision) {
+                if ('silent' in decision) {
+                    // Stalled at the TCP level: not even a close frame is answered. The ws library would
+                    // otherwise answer one on the gateway's behalf and hide what a real stall costs.
+                    (connection.socket as any)._socket.pause()
+                } else if ('refuse' in decision) {
                     connection.sendError(decision.refuse)
                 } else if ('connectedHeaders' in decision) {
                     connection.send('CONNECTED', decision.connectedHeaders)

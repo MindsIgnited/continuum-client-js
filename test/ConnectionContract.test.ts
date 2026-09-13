@@ -369,6 +369,142 @@ describe('Connection contract', () => {
         expect(continuum.eventBus.isConnectionActive()).toBe(false)
     })
 
+    it('a stalled handshake is abandoned at connectTimeoutMs, not at the socket\'s own close timeout', {timeout: 30000}, async () => {
+        // The socket is accepted and the CONNECT never answered. Abandoning the attempt has to discard the
+        // socket: closing it politely waits on a peer that is not there, for as long as the socket
+        // library cares to wait, and that time is charged to every attempt.
+        gateway.onConnect = () => ({silent: true})
+        const info = connectionInfo({connectTimeoutMs: 1000, maxConnectionAttempts: 1})
+        await expect(settles(continuum.connect(info), 6000)).rejects.toThrow(/Max number of reconnection attempts/)
+        expect(continuum.eventBus.isConnectionActive()).toBe(false)
+    })
+
+    it('connectTimeoutMs of zero does not switch the bound off', {timeout: 30000}, async () => {
+        gateway.onConnect = () => ({silent: true})
+        const info = connectionInfo({connectTimeoutMs: 0, maxConnectionAttempts: 1})
+        await expect(settles(continuum.connect(info), 20000)).rejects.toThrow(/Max number of reconnection attempts/)
+    })
+
+    it('a service reply that lands during a requested disconnect does not escape the process', {timeout: 30000}, async () => {
+        // A hosted service finishes a call after its host asked to disconnect. There is nowhere to send
+        // the reply; that is a fact to log, not an exception to let loose from a handler nothing awaits.
+        const uncaught: unknown[] = []
+        const collect = (e: unknown): void => { uncaught.push(e) }
+        process.on('uncaughtException', collect)
+        process.on('unhandledRejection', collect)
+        try {
+            let finish: (v: string) => void = () => undefined
+            let entered = false
+            // The supervisor maps prototype methods, as a decorated service class has
+            class SlowService {
+                wait(): Promise<string> {
+                    entered = true
+                    return new Promise(resolve => { finish = resolve })
+                }
+            }
+            continuum.serviceRegistry.register(new ServiceIdentifier('com.example', 'Slow'), new SlowService())
+            await continuum.connect(connectionInfo())
+            const first = await gateway.waitForConnection(0)
+            const subscription = await first.waitForFrame(f => f.command === 'SUBSCRIBE' && (f.headers['destination'] ?? '').includes('com.example.Slow'),
+                                                          5000, 'the service subscription')
+            first.sendMessage(subscription.headers['destination'] + '/wait',
+                              {'reply-to': 'srv://caller@continuum.js.EventBus/replyHandler', '__correlation-id': 'c1', 'content-type': 'application/json'},
+                              '[]', subscription.headers['destination'])
+            await waitFor(() => entered, 5000)
+            expect(entered, 'the service is in the middle of the call').toBe(true)
+
+            gateway.onDisconnect = 'ignore'
+            const closing = continuum.disconnect()
+            await sleep(200)
+            finish('done')
+            await sleep(500)
+            expect(uncaught, 'nothing escapes to the process').toEqual([])
+            await settles(closing, 10000)
+        } finally {
+            process.off('uncaughtException', collect)
+            process.off('unhandledRejection', collect)
+        }
+    })
+
+    it('a stream created before a close does not decide where the next connection\'s replies are watched', {timeout: 30000}, async () => {
+        // Subscribing after the close to a stream created before it must fail, not quietly set up the
+        // reply address of a connection that no longer exists - the next connection has its own, and a
+        // request on it must get its reply.
+        gateway.handlers.set('srv://com.example.Svc/echo', (frame, connection) =>
+            connection.sendMessage(frame.headers['reply-to'],
+                                   {'__correlation-id': frame.headers['__correlation-id'], 'content-type': 'application/json'},
+                                   '"ok"'))
+        const info = connectionInfo({connectHeaders: {login: 'guest', passcode: 'guest', 'reply-to-id': 'fixed-by-caller'}})
+        await continuum.connect(info)
+        const proxy = continuum.serviceProxy('com.example.Svc')
+        const stale = proxy.invokeStream('echo', [])
+        await continuum.disconnect()
+
+        let staleError: unknown = null
+        stale.subscribe({error: e => staleError = e})
+        await waitFor(() => staleError != null, 2000)
+        expect(staleError, 'a stream subscribed after the close fails at once').toBeInstanceOf(ContinuumError)
+
+        await continuum.connect(info)
+        expect(await settles(proxy.invoke('echo', []), 5000), 'a request on the new connection gets its reply').toBe('ok')
+    })
+
+    it('disconnect() during a close the server started is still a requested close', {timeout: 30000}, async () => {
+        // The server sent an ERROR and the socket is on its way down when the app, shutting down, calls
+        // disconnect(). The app asked to be disconnected; reporting the close as fatal would have its
+        // recovery handler reconnect in the middle of its shutdown.
+        const fatal: ContinuumError[] = []
+        continuum.eventBus.fatalErrors.subscribe(e => fatal.push(e))
+        await continuum.connect(connectionInfo())
+        const first = await gateway.waitForConnection(0)
+
+        // Placed after the manager's own handler and deferred past the tick it defers its close to, so
+        // disconnect() lands while that close is already in progress
+        const manager = (continuum.eventBus as any).stompConnectionManager
+        let disconnected: Promise<void> | null = null
+        manager.rxStomp.stompErrors$.subscribe(() => queueMicrotask(() => queueMicrotask(() => {
+            expect(continuum.eventBus.isConnectionActive(), 'the server-started close is in progress').toBe(false)
+            disconnected = continuum.disconnect()
+        })))
+        first.sendError('Something the server was doing for you failed')
+        await waitFor(() => disconnected != null, 2000)
+        await settles(disconnected!, 10000)
+        await sleep(200)
+        expect(fatal, 'a close the caller asked for is never fatal').toEqual([])
+    })
+
+    it('an unsupported control value fails the request, not the process', {timeout: 30000}, async () => {
+        const uncaught: unknown[] = []
+        const collect = (e: unknown): void => { uncaught.push(e) }
+        process.on('uncaughtException', collect)
+        process.on('unhandledRejection', collect)
+        try {
+            gateway.handlers.set('srv://com.example.Svc/ctl', (frame, connection) =>
+                connection.sendMessage(frame.headers['reply-to'],
+                                       {'__correlation-id': frame.headers['__correlation-id'], control: 'suspend'}))
+            await continuum.connect(connectionInfo())
+            await expect(settles(continuum.serviceProxy('com.example.Svc').invoke('ctl', []), 5000)).rejects.toThrow(/not supported/)
+            await sleep(300)
+            expect(uncaught, 'nothing escapes to the process').toEqual([])
+        } finally {
+            process.off('uncaughtException', collect)
+            process.off('unhandledRejection', collect)
+        }
+    })
+
+    it('a host the WebSocket constructor refuses rejects connect() rather than hanging it', {timeout: 30000}, async () => {
+        // A URL that parses but a WebSocket will not open; the constructor throws inside a stompjs call
+        // nothing awaits, and without help the attempt neither fails nor proceeds
+        const info = connectionInfo({host: `${gateway.host}#prod`})
+        await expect(settles(continuum.connect(info), 5000)).rejects.toBeInstanceOf(ContinuumError)
+        expect(continuum.eventBus.isConnectionActive()).toBe(false)
+    })
+
+    it('connected-info that is a JSON array is refused', {timeout: 30000}, async () => {
+        gateway.onConnect = () => ({connectedHeaders: {version: '1.2', 'heart-beat': '0,0', 'connected-info': '[]'}})
+        await expect(settles(continuum.connect(connectionInfo({disableStickySession: true})), 10000)).rejects.toThrow(/proper data/)
+    })
+
     it('one observe() result subscribed twice is one subscription on the wire', {timeout: 30000}, async () => {
         await continuum.connect(connectionInfo())
         const events = continuum.eventBus.observe('srv://com.example.Shared')
