@@ -4,7 +4,7 @@ import {ContinuumError} from '@/api/errors/ContinuumError'
 import {ConnectedInfo} from '@/api/security/ConnectedInfo'
 import {EventConstants} from '@/core/api/IEventBus'
 import {IFrame, IMessage, IRxStompPublishParams, RxStomp, RxStompConfig, RxStompState, StompHeaders} from '@stomp/rx-stomp'
-import {ReconnectionTimeMode} from '@stomp/stompjs'
+import {IStompSocket, ReconnectionTimeMode} from '@stomp/stompjs'
 import {Observable, Subject} from 'rxjs'
 import {v4 as uuidv4} from 'uuid'
 import debug from 'debug'
@@ -135,14 +135,30 @@ export class StompConnectionManager {
             // to another activation while it was waiting, whatever it was about to do is no longer wanted
             const abandoned = (): boolean => this.rxStomp !== rxStomp
 
+            const connectTimeoutMs = connectionInfo.connectTimeoutMs
             const stompConfig: RxStompConfig = {
-                brokerURL: url,
+                // The constructor throws on a URL that parses but a WebSocket will not open, or when there
+                // is no WebSocket at all, and it does so inside a stompjs call nothing awaits - so caught
+                // here, and the attempt ended with the reason. The stub handed back is already closed, which
+                // stompjs treats as nothing to wait for.
+                webSocketFactory: (): IStompSocket => {
+                    try {
+                        return new WebSocket(url, rxStomp.stompClient.stompVersions.protocolVersions()) as unknown as IStompSocket
+                    } catch (e: any) {
+                        this.closeAfterCallback(new ContinuumError(`Could not open a WebSocket to ${url}: ${e?.message ?? e}`), true)
+                        return closedSocket(url)
+                    }
+                },
                 heartbeatIncoming: 120000,
                 heartbeatOutgoing: 30000,
                 reconnectDelay: this.INITIAL_RECONNECT_DELAY,
                 // A peer that accepts the socket and then says nothing would otherwise hold the attempt
-                // open forever; past this stompjs abandons it and it counts as a failed attempt
-                connectionTimeout: connectionInfo.connectTimeoutMs ?? this.DEFAULT_CONNECT_TIMEOUT_MS,
+                // open forever; past this stompjs abandons it and it counts as a failed attempt. Zero
+                // would switch the watcher off, which no caller means by it.
+                connectionTimeout: connectTimeoutMs != null && connectTimeoutMs > 0 ? connectTimeoutMs : this.DEFAULT_CONNECT_TIMEOUT_MS,
+                // Abandoning means discarding the socket. Closing it politely waits on the peer that
+                // stalled, for as long as the socket library cares to wait, and charges that to the attempt.
+                discardWebsocketOnCommFailure: true,
                 beforeConnect: async (): Promise<void> => {
                     if (abandoned()) {
                         return
@@ -160,6 +176,9 @@ export class StompConnectionManager {
                     if (abandoned()) {
                         return
                     }
+                    // Each attempt reports its own first error: abandoning a stalled attempt closes the
+                    // socket, and the socket library reports that as an error of its own, after the real one
+                    this.lastWebsocketError = null
                     // Headers are built fresh for every attempt, so nothing is ever mutated: not the
                     // caller's object, and not what an earlier attempt sent. A caller's function that
                     // cannot answer ends the connection rather than the attempt: stompjs does not catch
@@ -200,7 +219,7 @@ export class StompConnectionManager {
             rxStomp.stompClient.reconnectTimeMode = ReconnectionTimeMode.EXPONENTIAL
 
             rxStomp.webSocketErrors$.subscribe((value: Event) => {
-                this.lastWebsocketError = value
+                this.lastWebsocketError ??= value
             })
 
             // A STOMP ERROR frame means the server is done with us: it refused the connect, refused a
@@ -267,9 +286,11 @@ export class StompConnectionManager {
      * @param force if true the socket is discarded rather than closed with a DISCONNECT frame
      */
     public deactivate(force?: boolean): Promise<void> {
-        // From here on, the reason the connection ends is that it was asked to; whatever the server
-        // says on the way out - an ERROR for something it was still processing, say - is not one
-        if (this.state === 'active') {
+        // From here on, the reason the connection ends is that it was asked to. Whatever the server
+        // says on the way out - an ERROR for something it was still processing, say - is not one, and
+        // nor is whatever it said just before: a close already in progress for the server's reasons is
+        // one the caller has now asked for too, and asking is what decides whether it is reported.
+        if (this.state !== 'inactive') {
             this.closeRequested = true
         }
         return this.close(undefined, force)
@@ -315,7 +336,11 @@ export class StompConnectionManager {
                 await this.deactivateWithinGrace(rxStomp, force)
             } finally {
                 const rejectActivation = this.rejectActivation
-                const closedWith = this.closingError
+                const reason = this.closingError
+                const closedWith = this.closeRequested ? undefined : reason
+                // stompjs clears its connection watcher only on connect; left armed after a close it
+                // would fire into nothing and keep the process alive until it did
+                clearTimeout((rxStomp.stompClient as any)._connectionWatcher)
                 this.rejectActivation = null
                 this.closingError = undefined
                 this.closeRequested = false
@@ -324,7 +349,7 @@ export class StompConnectionManager {
                 this.state = 'inactive'
                 this.eventSubject.next({type: 'closed', error: closedWith})
                 if (rejectActivation) {
-                    rejectActivation(closedWith ?? new ContinuumError('Connection was closed before it was established'))
+                    rejectActivation(reason ?? new ContinuumError('Connection was closed before it was established'))
                 }
             }
         })()
@@ -384,7 +409,7 @@ export class StompConnectionManager {
             this.debugLogger(`Unreadable ${EventConstants.CONNECTED_INFO_HEADER} header: ${e}`)
             return null
         }
-        if (connectedInfo == null || typeof connectedInfo !== 'object') {
+        if (connectedInfo == null || typeof connectedInfo !== 'object' || Array.isArray(connectedInfo)) {
             return null
         }
         if (!connectionInfo.disableStickySession && (connectedInfo.sessionId == null || connectedInfo.replyToId == null)) {
@@ -433,4 +458,19 @@ export class StompConnectionManager {
         }
     }
 
+}
+
+/** A socket that was never open, for stompjs to find nothing to wait for on */
+function closedSocket(url: string): IStompSocket {
+    return {
+        url,
+        readyState: 3, // CLOSED
+        binaryType: 'arraybuffer',
+        onclose: null,
+        onerror: null,
+        onmessage: null,
+        onopen: null,
+        close(): void { /* nothing to close */ },
+        send(): void { /* nothing to send on */ }
+    }
 }

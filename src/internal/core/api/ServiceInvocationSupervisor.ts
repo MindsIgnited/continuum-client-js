@@ -215,7 +215,7 @@ export class ServiceInvocationSupervisor {
 
     private processMethodInvocationResult(event: IEvent, result: any): void {
         const outgoingEvent = this.returnValueConverter.convert(event.headers, result)
-        this._eventBus.send(outgoingEvent)
+        this.reply(event, outgoingEvent)
     }
 
     private handleException(event: IEvent, error: any): void {
@@ -227,7 +227,20 @@ export class ServiceInvocationSupervisor {
                     ]),
             new TextEncoder().encode(JSON.stringify({ message: error.message }))
         )
-        this._eventBus.send(errorEvent)
+        this.reply(event, errorEvent)
+    }
+
+    /**
+     * A reply lands whenever the call finishes, which can be after the host has disconnected. There is
+     * then nowhere to send it; that is worth a line in the log, not an exception let loose from a
+     * handler nothing awaits.
+     */
+    private reply(event: IEvent, reply: IEvent): void {
+        try {
+            this._eventBus.send(reply)
+        } catch (e) {
+            this.log.warn(`Could not send the reply for ${event.cri}: ${(e as Error).message}`)
+        }
     }
 
     private validateReplyTo(event: IEvent): boolean {

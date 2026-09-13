@@ -203,6 +203,12 @@ export class EventBus implements IEventBus {
             return throwError(() => this.createSendUnavailableError())
         }
         return new Observable<IEvent>((subscriber) => {
+            // Checked again here: an Observable made while connected may be subscribed after the
+            // connection closed, and must not set up the reply address of a connection that is gone
+            if (!this.stompConnectionManager.active) {
+                subscriber.error(this.createSendUnavailableError())
+                return
+            }
 
             if (this.requestRepliesObservable == null) {
                 this.requestRepliesSubject = new Subject<IEvent>()
@@ -229,7 +235,9 @@ export class EventBus implements IEventBus {
                                                           finished = true
                                                           subscriber.complete()
                                                       } else {
-                                                          throw new Error('Control Header ' + value.headers.get(EventConstants.CONTROL_HEADER) + ' is not supported')
+                                                          // Thrown from here it would reach no one but the process
+                                                          finished = true
+                                                          subscriber.error(new Error('Control Header ' + value.headers.get(EventConstants.CONTROL_HEADER) + ' is not supported'))
                                                       }
 
                                                   } else if (value.hasHeader(EventConstants.ERROR_HEADER)) {
