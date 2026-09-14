@@ -1,39 +1,79 @@
 import {ConnectionInfo} from '@/api/ConnectionInfo'
+import {ConnectionRefusedError} from '@/api/errors/ConnectionRefusedError'
+import {ContinuumError} from '@/api/errors/ContinuumError'
 import {ConnectedInfo} from '@/api/security/ConnectedInfo'
 import {EventConstants} from '@/core/api/IEventBus'
-import {IFrame, RxStomp, RxStompConfig, StompHeaders} from '@stomp/rx-stomp'
-import {ReconnectionTimeMode} from '@stomp/stompjs'
-import {Subscription} from 'rxjs'
+import {IFrame, IMessage, IRxStompPublishParams, RxStomp, RxStompConfig, RxStompState, StompHeaders} from '@stomp/rx-stomp'
+import {IStompSocket, ReconnectionTimeMode, TickerStrategy} from '@stomp/stompjs'
+import {Observable, Subject} from 'rxjs'
 import {v4 as uuidv4} from 'uuid'
 import debug from 'debug'
 
 /**
+ * What the connection reports about itself, in the order it happens.
+ *
+ * `lost`: the socket of an established connection closed. Reconnection carries on underneath, but
+ * anything in flight on the old socket cannot complete and should be failed now.
+ *
+ * `closed`: the connection is down and will not reconnect. Emitted exactly once per activation, after
+ * the manager is already inactive, so a subscriber may call activate() again from inside the handler.
+ * `error` says why when it was not asked for: the server refused us with an ERROR frame, or the bound
+ * on reconnection attempts was reached. It is absent when deactivate() was called.
+ */
+export type ConnectionEvent =
+    | { type: 'lost' }
+    | { type: 'closed', error?: ContinuumError }
+
+/**
  * Creates a new RxStomp client and manages it
  * This is here to simplify the logic needed for connection management and the usage of the client.
+ *
+ * The manager is a small state machine: inactive -> active -> closing -> inactive. Everything else about
+ * the connection is reported through {@link events}; nothing here needs to be read back after the fact.
  */
 export class StompConnectionManager {
 
-    public lastWebsocketError: Event | null = null
-    /**
-     * This will return true if a {@link ConnectionInfo#maxConnectionAttempts} threshold was set and was reached
-     */
-    public maxConnectionAttemptsReached: boolean = false
-    public rxStomp: RxStomp | null = null
+    public readonly events: Observable<ConnectionEvent>
+    private readonly eventSubject = new Subject<ConnectionEvent>()
     private readonly INITIAL_RECONNECT_DELAY: number = 2000
     private readonly MAX_RECONNECT_DELAY: number = 120000 // 2 mins
     private readonly JITTER_MAX: number = 5000
-    private connectionAttempts: number = 0
-    private initialConnectionSuccessful: boolean = false
+    /** How long a single attempt may take to reach CONNECTED before it is abandoned, unless the caller says otherwise */
+    private readonly DEFAULT_CONNECT_TIMEOUT_MS: number = 10000
+    /** How long a polite close waits for the peer's part in it before the socket is simply discarded */
+    private readonly POLITE_CLOSE_GRACE_MS: number = 5000
     private debugLogger = debug('continuum:stomp')
+
+    private state: 'inactive' | 'active' | 'closing' = 'inactive'
+    private rxStomp: RxStomp | null = null
+    /** The teardown in progress, so a deactivate() that overlaps another waits on it rather than repeating it */
+    private closing: Promise<void> | null = null
+    /** Why the teardown in progress is happening, if it has a reason; an overlapping close may supply one */
+    private closingError: ContinuumError | undefined = undefined
+    /** Whether the teardown in progress was asked for by the caller, in which case nothing that happens during it is a reason */
+    private closeRequested: boolean = false
+    /** Rejects the activate() promise, until the first CONNECTED frame settles it */
+    private rejectActivation: ((error: ContinuumError) => void) | null = null
+
     private replyToId = uuidv4()
-    public _replyToCri =  EventConstants.SERVICE_DESTINATION_PREFIX + this.replyToId + ':' + uuidv4() + '@continuum.js.EventBus/replyHandler'
-    public deactivationHandler: (() => void) | null = null
+    private _replyToCri = EventConstants.SERVICE_DESTINATION_PREFIX + this.replyToId + ':' + uuidv4() + '@continuum.js.EventBus/replyHandler'
+
+    // Per activation
+    /** The session the server gave us, when sticky sessions are on. The only thing a reconnect presents. */
+    private sessionId: string | null = null
+    private connectionAttempts: number = 0
+    private everConnected: boolean = false
+    private lastWebsocketError: Event | null = null
+
+    constructor() {
+        this.events = this.eventSubject.asObservable()
+    }
 
     /**
      * @return true if this {@link StompConnectionManager} is actively trying to maintain a connection to the Stomp server, false if not.
      */
     public get active(): boolean {
-        return !!this.rxStomp;
+        return this.state === 'active'
     }
 
     public get replyToCri(): string {
@@ -44,198 +84,432 @@ export class StompConnectionManager {
      * return true if this {@link StompConnectionManager} is active and has a connection to the stomp server
      */
     public get connected(): boolean {
-        return this.rxStomp != null
-            && this.rxStomp.connected()
+        return this.active && this.rxStomp!.connected()
     }
 
+    /**
+     * Connects, and keeps reconnecting until {@link deactivate} is called, the server refuses a connect, or
+     * {@link ConnectionInfo#maxConnectionAttempts} is reached. The returned promise settles on the first
+     * CONNECTED frame; a refusal or exhausted bound before that rejects it, after that it is reported on
+     * {@link events} as a `closed` event carrying the error.
+     */
     public activate(connectionInfo: ConnectionInfo): Promise<ConnectedInfo> {
+        if (!connectionInfo) {
+            return Promise.reject(new ContinuumError('You must supply a valid connectionInfo object'))
+        }
+        if (!connectionInfo.host) {
+            return Promise.reject(new ContinuumError('No host provided'))
+        }
+        if (this.state === 'closing') {
+            return Promise.reject(new ContinuumError('Stomp connection is still closing'))
+        }
+        if (this.state === 'active') {
+            return Promise.reject(new ContinuumError('Stomp connection already active'))
+        }
+
+        this.state = 'active'
+        this.sessionId = null
+        this.connectionAttempts = 0
+        this.everConnected = false
+        this.lastWebsocketError = null
+
+        const url = 'ws' + (connectionInfo.useSSL ? 's' : '')
+            + '://' + connectionInfo.host
+            + (connectionInfo.port ? ':' + connectionInfo.port : '') + '/v1'
+        // The WebSocket constructor throws on a bad URL, from inside a stompjs call nothing awaits, and
+        // the attempt would neither fail nor proceed. Refused here instead, before anything is started.
+        try {
+            new URL(url)
+        } catch (e) {
+            this.state = 'inactive'
+            return Promise.reject(new ContinuumError(`Invalid connection URL ${url}: ${(e as Error).message}`))
+        }
+
+        const rxStomp = new RxStomp()
+        this.rxStomp = rxStomp
+
         return new Promise((resolve, reject): void => {
-            // Validate state and short circuit
-            if(!connectionInfo){
-                reject('You must supply a valid connectionInfo object')
-                return
+            this.rejectActivation = reject
+
+            // This runs inside stompjs on the activation that scheduled it; if the manager has moved on
+            // to another activation while it was waiting, whatever it was about to do is no longer wanted
+            const abandoned = (): boolean => this.rxStomp !== rxStomp
+
+            const connectTimeoutMs = connectionInfo.connectTimeoutMs
+            const effectiveConnectTimeoutMs = connectTimeoutMs != null && connectTimeoutMs > 0 ? connectTimeoutMs : this.DEFAULT_CONNECT_TIMEOUT_MS
+            const withinConnectTimeout = <T>(work: Promise<T>): Promise<T> => {
+                let timer: ReturnType<typeof setTimeout> | undefined
+                const expired = new Promise<never>((_, reject) => {
+                    timer = setTimeout(() => reject(new Error(`connectHeaders did not settle within ${effectiveConnectTimeoutMs}ms`)),
+                                       effectiveConnectTimeoutMs)
+                })
+                return Promise.race([work, expired]).finally(() => clearTimeout(timer))
             }
-
-            if (!(connectionInfo.host)) {
-                reject('No host provided')
-                return
-            }
-
-            if(this.rxStomp) {
-                reject('Stomp connection already active')
-                return
-            }
-
-            // we reset most state here so, it will persist on a connection failure
-            this.connectionAttempts = 0
-            this.initialConnectionSuccessful = false
-            this.lastWebsocketError = null
-            this.maxConnectionAttemptsReached = false
-
-            const url = 'ws' + (connectionInfo.useSSL ? 's' : '')
-                + '://' + connectionInfo.host
-                + (connectionInfo.port ? ':' + connectionInfo.port : '') + '/v1'
-
-            this.rxStomp = new RxStomp()
-
-            let connectHeadersInternal: StompHeaders = (typeof connectionInfo.connectHeaders !== 'function' && connectionInfo.connectHeaders != null ? connectionInfo.connectHeaders : {})
-
             const stompConfig: RxStompConfig = {
-                brokerURL: url,
-                connectHeaders: connectHeadersInternal,
+                // The constructor throws on a URL that parses but a WebSocket will not open, or when there
+                // is no WebSocket at all, and it does so inside a stompjs call nothing awaits - so caught
+                // here, and the attempt ended with the reason. The stub handed back is already closed, which
+                // stompjs treats as nothing to wait for.
+                webSocketFactory: (): IStompSocket => {
+                    try {
+                        return new WebSocket(url, rxStomp.stompClient.stompVersions.protocolVersions()) as unknown as IStompSocket
+                    } catch (e: any) {
+                        this.closeAfterCallback(new ContinuumError(`Could not open a WebSocket to ${url}: ${e?.message ?? e}`), true)
+                        return closedSocket(url)
+                    }
+                },
                 heartbeatIncoming: 120000,
                 heartbeatOutgoing: 30000,
                 reconnectDelay: this.INITIAL_RECONNECT_DELAY,
+                // A peer that accepts the socket and then says nothing would otherwise hold the attempt
+                // open forever; past this stompjs abandons it and it counts as a failed attempt. Zero
+                // would switch the watcher off, which no caller means by it.
+                connectionTimeout: effectiveConnectTimeoutMs,
+                // Abandoning means discarding the socket. Closing it politely waits on the peer that
+                // stalled, for as long as the socket library cares to wait, and charges that to the attempt.
+                discardWebsocketOnCommFailure: true,
+                // Outgoing heartbeats from a worker where there is one: a browser throttles a hidden
+                // tab's timers until the gateway, hearing nothing, closes the socket. Falls back to a
+                // plain interval where there is no Worker, as in Node.
+                heartbeatStrategy: TickerStrategy.Worker,
                 beforeConnect: async (): Promise<void> => {
-
-                    if(typeof connectionInfo.connectHeaders === 'function'){
-                        const headers = await connectionInfo.connectHeaders()
-                        for(const key in headers) {
-                            connectHeadersInternal[key] = headers[key]
+                    if (abandoned()) {
+                        return
+                    }
+                    // If max connections are set then make sure we have not exceeded that threshold
+                    if (connectionInfo.maxConnectionAttempts) {
+                        this.connectionAttempts++
+                        if (this.connectionAttempts > connectionInfo.maxConnectionAttempts) {
+                            const message = (this.lastWebsocketError as any)?.message ?? 'UNKNOWN'
+                            await this.close(new ContinuumError(`Max number of reconnection attempts reached. Last WS Error ${message}`))
+                            return
                         }
                     }
-
-                    if(connectionInfo.disableStickySession){
-                        connectHeadersInternal[EventConstants.DISABLE_STICKY_SESSION_HEADER] = 'true'
+                    await this.connectionJitterDelay()
+                    if (abandoned()) {
+                        return
                     }
-
+                    // Each attempt reports its own first error: abandoning a stalled attempt closes the
+                    // socket, and the socket library reports that as an error of its own, after the real one
+                    this.lastWebsocketError = null
+                    // Headers are built fresh for every attempt, so nothing is ever mutated: not the
+                    // caller's object, and not what an earlier attempt sent. A caller's function that
+                    // cannot answer ends the connection rather than the attempt: stompjs does not catch
+                    // what escapes from here, and a rejection would leave everything hanging, still active.
+                    let headers: StompHeaders
+                    try {
+                        // The caller's function is part of the attempt, so the attempt's bound covers
+                        // it: a token endpoint that never answers is a stalled attempt like any other
+                        headers = await withinConnectTimeout(this.connectHeadersForAttempt(connectionInfo))
+                    } catch (e: any) {
+                        if (!abandoned()) {
+                            await this.close(new ContinuumError(`connectHeaders could not be produced: ${e?.message ?? e}`))
+                        }
+                        return
+                    }
+                    if (abandoned()) {
+                        return
+                    }
                     // use replyToId if provided in connectionInfo, otherwise set it
-                    if(connectHeadersInternal[EventConstants.REPLY_TO_ID_HEADER]){
-                        this.replyToId = connectHeadersInternal[EventConstants.REPLY_TO_ID_HEADER]
-                        this._replyToCri =  EventConstants.SERVICE_DESTINATION_PREFIX + this.replyToId + ':' + uuidv4() + '@continuum.js.EventBus/replyHandler'
-                    }else{
-                        connectHeadersInternal[EventConstants.REPLY_TO_ID_HEADER] = this.replyToId
+                    if (headers[EventConstants.REPLY_TO_ID_HEADER]) {
+                        this.replyToId = headers[EventConstants.REPLY_TO_ID_HEADER]
+                        this._replyToCri = EventConstants.SERVICE_DESTINATION_PREFIX + this.replyToId + ':' + uuidv4() + '@continuum.js.EventBus/replyHandler'
+                    } else {
+                        headers[EventConstants.REPLY_TO_ID_HEADER] = this.replyToId
                     }
-
-                    // If max connections are set then make sure we have not exceeded that threshold
-                    if(connectionInfo?.maxConnectionAttempts){
-                        this.connectionAttempts++
-
-                       if(this.connectionAttempts > connectionInfo.maxConnectionAttempts){
-
-                           // Reached threshold give up
-                           this.maxConnectionAttemptsReached = true
-                           await this.deactivate()
-
-                           // If we have not made an initial connection, the promise is not yet resolved
-                           if(!this.initialConnectionSuccessful) {
-                               let message = (this.lastWebsocketError as any)?.message ? (this.lastWebsocketError as any)?.message : 'UNKNOWN'
-                               reject(`Max number of reconnection attempts reached. Last WS Error ${message}`)
-                           }
-                       }else{
-                           await this.connectionJitterDelay();
-                       }
-                   }else{
-                        await this.connectionJitterDelay();
-                   }
-               }
+                    rxStomp.stompClient.connectHeaders = headers
+                }
             }
 
-            if(this.debugLogger.enabled){
+            if (this.debugLogger.enabled) {
                 stompConfig.debug = (msg: string): void => {
                     this.debugLogger(msg)
                 }
             }
 
-            //*** Begin Block that handles backoff ***
-            this.rxStomp.configure(stompConfig)
+            rxStomp.configure(stompConfig)
 
             // Set values that are only accessible from the stompClient
-            this.rxStomp.stompClient.maxReconnectDelay = this.MAX_RECONNECT_DELAY
-            this.rxStomp.stompClient.reconnectTimeMode = ReconnectionTimeMode.EXPONENTIAL
+            rxStomp.stompClient.maxReconnectDelay = this.MAX_RECONNECT_DELAY
+            rxStomp.stompClient.reconnectTimeMode = ReconnectionTimeMode.EXPONENTIAL
 
-            // Handles Websocket Errors
-            this.rxStomp.webSocketErrors$.subscribe(value => {
-                this.lastWebsocketError = value
+            rxStomp.webSocketErrors$.subscribe((value: Event) => {
+                this.lastWebsocketError ??= value
             })
 
-            // Handles Successful Connections
-            const connectedSubscription: Subscription = this.rxStomp.connected$.subscribe(() =>{
-                connectedSubscription.unsubscribe()
-                // Successful Connection
-                if(!this.initialConnectionSuccessful){
-                    this.initialConnectionSuccessful = true
+            // A STOMP ERROR frame means the server is done with us: it refused the connect, refused a
+            // reconnect presenting a session it no longer has, or rejected something we sent. The library
+            // cannot recover on its own - it holds no credentials, only the session id - so it closes and
+            // leaves connecting again to the caller. The socket is discarded rather than closed politely;
+            // there is nothing left to say, and waiting on the server's close would only delay the report.
+            rxStomp.stompErrors$.subscribe((frame: IFrame) => {
+                // STOMP escapes header values in every frame but CONNECT and CONNECTED, and stompjs
+                // undoes that only once CONNECTED has arrived on the socket. A refusal is an ERROR
+                // that arrives instead of CONNECTED, so its headers still carry the escapes.
+                this.closeAfterCallback(new ConnectionRefusedError(openOnThisSocket ? frame : unescapeHeaders(frame)), true)
+            })
+
+            // The socket of an established connection closing means whatever was in flight is gone.
+            // Only reported when the close was not ours: a deactivate() ends in a `closed` event instead.
+            let wasOpen = false
+            // Whether CONNECTED has arrived on the socket currently in use; each reconnect starts over
+            let openOnThisSocket = false
+            rxStomp.connectionState$.subscribe((state: RxStompState) => {
+                if (state === RxStompState.OPEN) {
+                    wasOpen = true
+                    openOnThisSocket = true
+                } else if (state === RxStompState.CONNECTING) {
+                    openOnThisSocket = false
+                } else if (wasOpen && (state === RxStompState.CLOSING || state === RxStompState.CLOSED)) {
+                    wasOpen = false
+                    if (this.state === 'active') {
+                        this.eventSubject.next({type: 'lost'})
+                    }
                 }
-            })
-
-            // This subscription is to handle any errors that occur during connection
-            const errorSubscription: Subscription = this.rxStomp.stompErrors$.subscribe((value: IFrame) => {
-                errorSubscription.unsubscribe()
-                const message = value.headers['message']
-                this.rxStomp?.deactivate()
-                this.rxStomp = null
-                reject(message)
             })
 
             // This is triggered when the server sends a CONNECTED frame.
-            const serverHeadersSubscription: Subscription = this.rxStomp.serverHeaders$.subscribe((value: StompHeaders) => {
-                let connectedInfoJson: string | undefined = value[EventConstants.CONNECTED_INFO_HEADER]
-                if (connectedInfoJson != null) {
+            rxStomp.serverHeaders$.subscribe((headers: StompHeaders) => {
+                // The credentials that opened this connection have done their work. They are cleared in
+                // place because stompjs keeps its own reference to this object; the next attempt is built afresh.
+                const sent = rxStomp.stompClient.connectHeaders
+                for (const key of Object.keys(sent)) {
+                    delete sent[key]
+                }
 
-                    const connectedInfo: ConnectedInfo = JSON.parse(connectedInfoJson)
+                const connectedInfo = this.parseConnectedInfo(headers, connectionInfo)
+                if (connectedInfo == null) {
+                    // The server has accepted us and holds a session, so it is told rather than cut off,
+                    // which means the socket is not discarded from inside the callback that delivered CONNECTED
+                    this.closeAfterCallback(new ContinuumError('Server did not return proper data for successful login'), false)
+                    return
+                }
 
-                    if(!connectionInfo.disableStickySession){
+                if (!connectionInfo.disableStickySession) {
+                    this.sessionId = connectedInfo.sessionId
+                }
+                // Each reconnect gets the full bound of attempts; a connection that recovers has not spent any
+                this.connectionAttempts = 0
+                this.lastWebsocketError = null
 
-                        serverHeadersSubscription.unsubscribe()
-
-                        if (connectedInfo.sessionId != null && connectedInfo.replyToId != null) {
-
-                            // Remove all information originally sent from the connect headers
-                            if (connectionInfo.connectHeaders != null) {
-                                for (let key in connectHeadersInternal) {
-                                    delete connectHeadersInternal[key]
-                                }
-                            }
-
-                            connectHeadersInternal[EventConstants.SESSION_HEADER] = connectedInfo.sessionId
-
-                            resolve(connectedInfo)
-                        } else {
-                            reject('Server did not return proper data for successful login')
-                        }
-
-                    }else if(typeof connectionInfo.connectHeaders === 'function'){
-                        // If the connect headers are supplied by a function we remove all the header values since they will be recreated on next connect
-                        for (let key in connectHeadersInternal) {
-                            delete connectHeadersInternal[key]
-                        }
-                        if(!this.initialConnectionSuccessful) {
-                            resolve(connectedInfo)
-                        }
-                    }else if(typeof connectionInfo.connectHeaders === 'object'){
-                        // static object we must leave intact for reuse
-                        serverHeadersSubscription.unsubscribe()
-                        resolve(connectedInfo)
-                    }
-                } else {
-                    reject('Server did not return proper data for successful login')
+                if (!this.everConnected) {
+                    this.everConnected = true
+                    this.rejectActivation = null
+                    resolve(connectedInfo)
                 }
             })
 
-            this.rxStomp.activate()
+            rxStomp.activate()
         })
     }
 
-    public async deactivate(force?: boolean): Promise<void> {
-        if(this.rxStomp){
-            await this.rxStomp.deactivate({force: force})
-            if(this.deactivationHandler){
-                this.deactivationHandler()
-            }
-            this.rxStomp = null
+    /**
+     * Closes the connection and stops reconnecting. Safe to call at any time: it does nothing when
+     * inactive, and a call that overlaps a close already in progress waits for that one.
+     * @param force if true the socket is discarded rather than closed with a DISCONNECT frame
+     */
+    public deactivate(force?: boolean): Promise<void> {
+        // From here on, the reason the connection ends is that it was asked to. Whatever the server
+        // says on the way out - an ERROR for something it was still processing, say - is not one, and
+        // nor is whatever it said just before: a close already in progress for the server's reasons is
+        // one the caller has now asked for too, and asking is what decides whether it is reported.
+        if (this.state !== 'inactive') {
+            this.closeRequested = true
         }
-        return
+        return this.close(undefined, force)
+    }
+
+    public publish(parameters: IRxStompPublishParams): void {
+        this.requireActive().publish(parameters)
+    }
+
+    public watch(cri: string): Observable<IMessage> {
+        return this.requireActive().watch(cri)
+    }
+
+    /**
+     * The one path out of the active state. The `closed` event is emitted only once the manager is
+     * inactive again, so a handler can activate() right away; the activate() promise, if still pending,
+     * is rejected with the same error after that.
+     */
+    private close(error?: ContinuumError, force?: boolean): Promise<void> {
+        if (this.state === 'inactive') {
+            return Promise.resolve()
+        }
+        const rxStomp = this.rxStomp!
+        if (this.closing) {
+            // A close that overlaps one in progress adds what it knows. A reason, if the first had none
+            // and was not the caller's own request: an ERROR frame arriving during a close the server
+            // initiated is still the reason it ended. And force, which stompjs honours while already
+            // deactivating - a polite close waiting on a peer that will never answer is exactly what a
+            // forced one is for.
+            if (!this.closeRequested) {
+                this.closingError ??= error
+            }
+            if (force) {
+                rxStomp.deactivate({force: true})
+                       .catch(e => this.debugLogger(`Error forcing a close already in progress: ${e}`))
+            }
+            return this.closing
+        }
+        this.state = 'closing'
+        this.closingError = this.closeRequested ? undefined : error
+        this.closing = (async (): Promise<void> => {
+            try {
+                await this.deactivateWithinGrace(rxStomp, force)
+            } finally {
+                const rejectActivation = this.rejectActivation
+                const reason = this.closingError
+                const closedWith = this.closeRequested ? undefined : reason
+                // stompjs clears its connection watcher only on connect; left armed after a close it
+                // would fire into nothing and keep the process alive until it did
+                clearTimeout((rxStomp.stompClient as any)._connectionWatcher)
+                this.rejectActivation = null
+                this.closingError = undefined
+                this.closeRequested = false
+                this.rxStomp = null
+                this.closing = null
+                this.state = 'inactive'
+                this.eventSubject.next({type: 'closed', error: closedWith})
+                if (rejectActivation) {
+                    rejectActivation(reason ?? new ContinuumError('Connection was closed before it was established'))
+                }
+            }
+        })()
+        return this.closing
+    }
+
+    /**
+     * A polite close - DISCONNECT, then wait for the RECEIPT and the socket's own close - is owed to a
+     * server holding a session, but a peer that never does its part does not get to hold the caller
+     * on it. Past the grace period the socket is discarded and the same promise settles.
+     */
+    private async deactivateWithinGrace(rxStomp: RxStomp, force?: boolean): Promise<void> {
+        const closing = rxStomp.deactivate({force: force})
+        if (force) {
+            return closing
+        }
+        let graceTimer: ReturnType<typeof setTimeout> | undefined
+        const graceExpired = new Promise<boolean>(resolve => {
+            graceTimer = setTimeout(() => resolve(true), this.POLITE_CLOSE_GRACE_MS)
+        })
+        const timedOut = await Promise.race([closing.then(() => false, () => false), graceExpired])
+        clearTimeout(graceTimer)
+        if (timedOut) {
+            this.debugLogger(`Polite close not completed within ${this.POLITE_CLOSE_GRACE_MS}ms, discarding the socket`)
+            rxStomp.deactivate({force: true})
+                   .catch(e => this.debugLogger(`Error discarding the socket after the grace period: ${e}`))
+        }
+        return closing
+    }
+
+    /**
+     * A close asked for from inside one of rx-stomp's own callbacks. It is deferred a tick so the
+     * callback's caller finishes first: a browser WebSocket has no terminate(), and the one stompjs
+     * installs runs the close handlers synchronously, which from inside onConnect would tear the
+     * client down before rx-stomp had finished bringing it up.
+     */
+    private closeAfterCallback(error: ContinuumError, force: boolean): void {
+        queueMicrotask(() => {
+            this.close(error, force).catch(e => this.debugLogger(`Error closing after ${error.message}: ${e}`))
+        })
+    }
+
+    /** The connected info the server sent, or null if it sent none or something unreadable */
+    private parseConnectedInfo(headers: StompHeaders, connectionInfo: ConnectionInfo): ConnectedInfo | null {
+        const connectedInfoJson: string | undefined = headers[EventConstants.CONNECTED_INFO_HEADER]
+        if (connectedInfoJson == null) {
+            return null
+        }
+        let connectedInfo: ConnectedInfo
+        try {
+            // STOMP 1.2 says CONNECTED is not escaped, and stompjs takes it at its word. The gateway's
+            // codec (vertx-stomp-lite HeaderCodec.encode) nonetheless doubles every backslash in the
+            // value, which leaves any JSON escape in it - a quote in a participant's name, say - unreadable
+            // until that is undone.
+            connectedInfo = JSON.parse(connectedInfoJson.replace(/\\\\/g, '\\'))
+        } catch (e) {
+            this.debugLogger(`Unreadable ${EventConstants.CONNECTED_INFO_HEADER} header: ${e}`)
+            return null
+        }
+        if (connectedInfo == null || typeof connectedInfo !== 'object' || Array.isArray(connectedInfo)) {
+            return null
+        }
+        if (!connectionInfo.disableStickySession && (connectedInfo.sessionId == null || connectedInfo.replyToId == null)) {
+            return null
+        }
+        return connectedInfo
+    }
+
+    /**
+     * The CONNECT headers for one attempt. With sticky sessions a reconnect presents only the session
+     * the server gave us; the library never holds the caller's credentials past the attempt that used
+     * them. Otherwise the caller's headers are sent - copied if static, called again if a function,
+     * which is what a function is for: credentials that may have changed since the last attempt.
+     */
+    private async connectHeadersForAttempt(connectionInfo: ConnectionInfo): Promise<StompHeaders> {
+        if (this.sessionId != null) {
+            return {[EventConstants.SESSION_HEADER]: this.sessionId}
+        }
+
+        const supplied = typeof connectionInfo.connectHeaders === 'function'
+            ? await connectionInfo.connectHeaders()
+            : connectionInfo.connectHeaders
+        // STOMP says CONNECT values are not escaped, and stompjs sends them as they are. The gateway's
+        // parser (vertx-stomp-lite HeaderCodec.decode) decodes them all the same, and drops the frame
+        // on an escape it does not know - so a backslash, as in a Windows domain login, is doubled here
+        // to arrive as sent. The counterpart to the CONNECTED handling in parseConnectedInfo.
+        const headers: StompHeaders = {}
+        for (const [key, value] of Object.entries(supplied ?? {})) {
+            headers[key] = String(value).replace(/\\/g, '\\\\')
+        }
+
+        if (connectionInfo.disableStickySession) {
+            headers[EventConstants.DISABLE_STICKY_SESSION_HEADER] = 'true'
+        }
+        return headers
+    }
+
+    private requireActive(): RxStomp {
+        if (!this.active) {
+            throw new ContinuumError('You must call connect on the event bus before sending any request')
+        }
+        return this.rxStomp!
     }
 
     /**
      * Make sure clients don't all try to reconnect at the same time.
      */
     private async connectionJitterDelay(): Promise<void> {
-        if(this.initialConnectionSuccessful) {
+        if (this.everConnected) {
             const randomJitter = Math.random() * this.JITTER_MAX;
             this.debugLogger(`Adding ${randomJitter}ms of jitter delay`)
             return new Promise(resolve => setTimeout(resolve, randomJitter));
         }
     }
 
+}
+
+/** The frame with its header values unescaped as STOMP 1.2 has them escaped: \\c, \\n, \\r and \\\\ */
+function unescapeHeaders(frame: IFrame): IFrame {
+    const headers: StompHeaders = {}
+    for (const [key, value] of Object.entries(frame.headers)) {
+        headers[key] = value.replace(/\\(.)/g, (whole, c: string) => ({c: ':', n: '\n', r: '\r', '\\': '\\'} as Record<string, string>)[c] ?? whole)
+    }
+    return {...frame, headers}
+}
+
+/** A socket that was never open, for stompjs to find nothing to wait for on */
+function closedSocket(url: string): IStompSocket {
+    return {
+        url,
+        readyState: 3, // CLOSED
+        binaryType: 'arraybuffer',
+        onclose: null,
+        onerror: null,
+        onmessage: null,
+        onopen: null,
+        close(): void { /* nothing to close */ },
+        send(): void { /* nothing to send on */ }
+    }
 }

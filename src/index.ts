@@ -29,6 +29,8 @@ export * from './api/LogManager'
 export * from './api/errors/ContinuumError'
 export * from './api/errors/AuthenticationError'
 export * from './api/errors/AuthorizationError'
+export * from './api/errors/ConnectionLostError'
+export * from './api/errors/ConnectionRefusedError'
 
 export * from './api/security/ConnectedInfo'
 export * from './api/security/IParticipant'

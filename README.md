@@ -9,15 +9,15 @@ For full documentation, see the [Continuum Framework Guide](https://mindignited.
 ## Installation
 
 ```bash
-npm install @mindignited/continuum-client
+npm install @kinotic/continuum-client
 # or
-pnpm add @mindignited/continuum-client
+pnpm add @kinotic/continuum-client
 ```
 
 ## Quick Start
 
 ```typescript
-import { Continuum, ConnectionInfo } from '@mindignited/continuum-client'
+import { Continuum, ConnectionInfo } from '@kinotic/continuum-client'
 
 const connectionInfo: ConnectionInfo = {
   host: 'localhost',
@@ -41,7 +41,7 @@ import { WebSocket } from 'ws'
 Object.assign(global, { WebSocket })
 
 // Now import and use Continuum
-import { Continuum } from '@mindignited/continuum-client'
+import { Continuum } from '@kinotic/continuum-client'
 ```
 
 > **Important:** The WebSocket polyfill must be applied *before* importing or using any Continuum functions.

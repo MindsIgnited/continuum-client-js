@@ -1,6 +1,7 @@
 // @ts-ignore
 import path from 'node:path'
-import {GenericContainer, PullPolicy, StartedTestContainer, Wait} from 'testcontainers'
+import {StartedTestContainer} from 'testcontainers'
+import {GATEWAY_IMAGE, startGateway} from './GatewayContainer'
 import {TestProject} from 'vitest/node.js'
 
 let container: StartedTestContainer
@@ -9,14 +10,9 @@ let container: StartedTestContainer
 export async function setup(project: TestProject) {
     // @ts-ignore
     if(import.meta.env.VITE_USE_GATEWAY_DOCKER === 'true') {
-        console.log('Starting Continuum Gateway')
+        console.log(`Starting Continuum Gateway ${GATEWAY_IMAGE}`)
 
-        container = await new GenericContainer(`mindignited/continuum-gateway-server:latest`)
-            .withExposedPorts(58503)
-            .withEnvironment({SPRING_PROFILES_ACTIVE: "clienttest"})
-            .withPullPolicy(PullPolicy.alwaysPull())
-            .withWaitStrategy(Wait.forHttp('/', 58503))
-            .start()
+        container = await startGateway()
 
         // @ts-ignore
         project.provide('CONTINUUM_HOST', container.getHost())
@@ -35,6 +31,11 @@ export async function setup(project: TestProject) {
 
 // Run once after all tests
 export async function teardown() {
+    // Nothing was started when VITE_USE_GATEWAY_DOCKER was not true, and tearing down what was
+    // never started turned every such run into a failed exit regardless of its tests
+    if (!container) {
+        return
+    }
     console.log('Shutting down Continuum Gateway...')
     await container.stop()
     console.log('Continuum Gateway shut down.')
