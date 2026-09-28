@@ -21,13 +21,17 @@ import {CursorPageable, OffsetPageable, Pageable} from '@/core/api/crud/Pageable
 
 export abstract class AbstractIterablePage<T> implements IterablePage<T> {
 
-    private readonly pageable: Pageable
+    private pageable: Pageable
     private currentPage: Page<T>
     private firstPage: boolean = true
+    private done: boolean = false
+    // Serializes calls to next() so overlapping callers cannot advance the same page twice
+    private pending: Promise<unknown> = Promise.resolve()
 
     protected constructor(pageable: Pageable,
                           page: Page<T>) {
-        this.pageable = pageable
+        // Copied so iterating never changes the Pageable the caller passed in
+        this.pageable = copyPageable(pageable)
         this.currentPage = page
     }
 
@@ -38,46 +42,55 @@ export abstract class AbstractIterablePage<T> implements IterablePage<T> {
      */
     protected abstract findNext(pageable: Pageable): Promise<Page<T>>;
 
-    async next(): Promise<IteratorResult<IterablePage<T>>> {
-        let ret: IteratorResult<IterablePage<T>>
-
-        if(this.firstPage) {
-            this.firstPage = false
-            // Check has content in case this is an empty page
-            // Such as when querying entities with no results
-            ret = {done: !this.hasContent(), value: this}
-        } else {
-            if(this.isOffsetPageable()){
-
-                const offsetPageable = this.pageable as OffsetPageable
-                offsetPageable.pageNumber++
-
-                // ignoring undefined should be fine since OffsetPageable should always have totalElements
-                const numPages = Math.ceil(this.totalElements as number / this.pageable.pageSize)
-
-                // Check if we are still less than the number of pages
-                if(offsetPageable.pageNumber < numPages){
-                    this.currentPage = await this.findNext(this.pageable)
-                    ret = {done: false, value: this}
-                }else{
-                    ret = {done: true, value: this}
-                }
-            }else{
-
-                const cursorPageable = this.pageable as CursorPageable
-                cursorPageable.cursor = this.currentPage.cursor as string || null
-
-                this.currentPage = await this.findNext(this.pageable)
-
-                // The last page will have a null cursor, so this will work correctly
-                ret = {done: this.isLastPage(), value: this}
-            }
-        }
+    next(): Promise<IteratorResult<IterablePage<T>>> {
+        const ret = this.pending.then(() => this.advance())
+        this.pending = ret.catch(() => undefined)
         return ret
+    }
+
+    async return(): Promise<IteratorResult<IterablePage<T>>> {
+        this.done = true
+        return {done: true, value: undefined}
     }
 
     [Symbol.asyncIterator](): AsyncIterableIterator<IterablePage<T>> {
         return this
+    }
+
+    private async advance(): Promise<IteratorResult<IterablePage<T>>> {
+        if(this.done){
+            return {done: true, value: undefined}
+        }
+        if(this.firstPage){
+            this.firstPage = false
+        }else{
+            // Stop without fetching when the page already yielded was the last one
+            if(this.isLastPage()){
+                this.done = true
+                return {done: true, value: undefined}
+            }
+            const nextPageable = this.nextPageable()
+            this.currentPage = await this.findNext(nextPageable)
+            // Only advanced once the fetch succeeds, so a failed next() can be retried
+            this.pageable = nextPageable
+        }
+        // An empty page ends iteration, such as querying entities with no results
+        // or the trailing empty page a search_after cursor ends with
+        if(!this.hasContent()){
+            this.done = true
+            return {done: true, value: undefined}
+        }
+        return {done: false, value: new PageSnapshot(this.currentPage, this.isLastPage(), this)}
+    }
+
+    private nextPageable(): Pageable {
+        const ret = copyPageable(this.pageable)
+        if(this.isOffsetPageable()){
+            (ret as OffsetPageable).pageNumber++
+        }else{
+            (ret as CursorPageable).cursor = this.currentPage.cursor as string
+        }
+        return ret
     }
 
     hasContent(): boolean {
@@ -87,11 +100,17 @@ export abstract class AbstractIterablePage<T> implements IterablePage<T> {
     isLastPage(): boolean {
         let ret: boolean
         if (this.isOffsetPageable()) {
-            // ignoring undefined should be fine since OffsetPageable should always have totalElements
-            const numPages = Math.ceil(this.totalElements as number / this.pageable.pageSize)
-            ret = numPages === (this.pageable as OffsetPageable).pageNumber + 1
+            const totalElements = this.currentPage.totalElements
+            if(totalElements !== null && totalElements !== undefined){
+                const numPages = Math.ceil(totalElements / this.pageable.pageSize)
+                ret = (this.pageable as OffsetPageable).pageNumber + 1 >= numPages
+            }else{
+                // Without a total, a short page is the only sign there is nothing more
+                ret = (this.currentPage.content?.length ?? 0) < this.pageable.pageSize
+            }
         }else{
-            ret = !this.firstPage && this.currentPage.cursor === null
+            // A null cursor means there is no more data
+            ret = !this.currentPage.cursor
         }
         return ret
     }
@@ -110,6 +129,46 @@ export abstract class AbstractIterablePage<T> implements IterablePage<T> {
 
     get content(): T[] | null | undefined {
         return this.currentPage.content
+    }
+
+}
+
+function copyPageable(pageable: Pageable): Pageable {
+    return Object.assign(Object.create(Object.getPrototypeOf(pageable)), pageable)
+}
+
+/**
+ * The value yielded for each page, fixed to that page's data so pages collected
+ * during iteration keep their own content. Iterating it continues the original iteration.
+ */
+class PageSnapshot<T> implements IterablePage<T> {
+
+    readonly totalElements: number | null | undefined
+    readonly cursor: string | null | undefined
+    readonly content: T[] | null | undefined
+
+    constructor(page: Page<T>,
+                private readonly lastPage: boolean,
+                private readonly iterator: IterablePage<T>) {
+        this.totalElements = page.totalElements
+        this.cursor = page.cursor
+        this.content = page.content
+    }
+
+    next(): Promise<IteratorResult<IterablePage<T>>> {
+        return this.iterator.next()
+    }
+
+    [Symbol.asyncIterator](): AsyncIterableIterator<IterablePage<T>> {
+        return this.iterator
+    }
+
+    isLastPage(): boolean {
+        return this.lastPage
+    }
+
+    hasContent(): boolean {
+        return this.content !== null && this.content !== undefined && this.content.length > 0
     }
 
 }
