@@ -1,6 +1,6 @@
 {
   "name": "@kinotic/continuum-client",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "author": "Mind Ignited <develop@mindignited.com>",
   "license": "Apache-2.0",
   "type": "module",
